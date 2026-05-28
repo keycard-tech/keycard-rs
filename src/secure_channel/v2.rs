@@ -10,9 +10,10 @@ use ccm::{
 };
 use hkdf::Hkdf;
 use k256::{
-    Sec1Point, PublicKey,
+    AffinePoint, Sec1Point, PublicKey,
     ecdh::EphemeralSecret,
     ecdsa::{Signature, VerifyingKey, signature::hazmat::PrehashVerifier},
+    elliptic_curve::sec1::ToSec1Point,
 };
 use sha2::{Digest, Sha256};
 
@@ -140,7 +141,8 @@ impl SecureChannel for SecureChannelV2 {
         let client_eph_priv = EphemeralSecret::try_generate_from_rng(&mut rng)
             .map_err(|_| Error::Crypto("Failed to generate ephemeral secret".to_string()))?;
         let client_eph_pub = client_eph_priv.public_key();
-        let client_eph_pub_bytes = Sec1Point::from(&client_eph_pub).to_bytes().to_vec();
+        let affine: AffinePoint = client_eph_pub.into();
+        let client_eph_pub_bytes = affine.to_sec1_point(false).to_bytes().to_vec(); // uncompressed
         self.client_eph_pub = Some(client_eph_pub_bytes.clone());
 
         // Build request: salt || client_eph_pub (uncompressed)
@@ -363,11 +365,16 @@ impl SecureChannelV2 {
             .ok_or_else(|| Error::Protocol("Card identity public key not available".to_string()))?;
 
         // Hash the transcript: SHA-256(PROTOCOL_LABEL || salt || client_pub || card_pub)
+        // Public keys are in uncompressed form (65 bytes) to match wire format.
+        let client_uncompressed = AffinePoint::from(*client_pub)
+            .to_sec1_point(false).to_bytes();
+        let card_uncompressed = AffinePoint::from(*card_pub)
+            .to_sec1_point(false).to_bytes();
         let mut hasher = Sha256::new();
         hasher.update(PROTOCOL_LABEL);
         hasher.update(salt);
-        hasher.update(&Sec1Point::from(client_pub).to_bytes());
-        hasher.update(&Sec1Point::from(card_pub).to_bytes());
+        hasher.update(&client_uncompressed);
+        hasher.update(&card_uncompressed);
         let transcript_hash = hasher.finalize();
 
         // Parse the signature

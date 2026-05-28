@@ -16,7 +16,16 @@
 #![cfg(feature = "pcsc")]
 
 use keycard_rs::{ApduCommand, ApduResponse, CardChannel, Error, KeycardCommandSet, PcscChannel, SecureChannelVersion};
-use keycard_rs::parsing::Bip32KeyPair;
+use keycard_rs::parsing::{Bip32KeyPair, Mnemonic};
+
+/// Test CA public key — only to be used in tests.
+const TEST_CA_PUBLIC_KEY: [u8; 33] = [
+    0x02, 0x58, 0x77, 0x22, 0x0a, 0xaa, 0xe6, 0xe5,
+    0x4a, 0x6f, 0x97, 0x46, 0x02, 0xd5, 0x99, 0x5c,
+    0x0f, 0xe2, 0x4a, 0x3e, 0xa7, 0xdd, 0xab, 0xd8,
+    0x64, 0x4b, 0xec, 0x79, 0x5b, 0x9d, 0xa0, 0x07,
+    0x43,
+];
 
 /// Wrapper that logs every APDU sent/received (for diagnostics).
 struct LoggingChannel {
@@ -52,7 +61,7 @@ impl CardChannel for LoggingChannel {
 #[ignore]
 fn select_applet() {
     let channel = PcscChannel::connect().expect("failed to connect to card via PC/SC");
-    let mut keycard = KeycardCommandSet::new(channel);
+    let mut keycard = KeycardCommandSet::new_with_ca(channel, TEST_CA_PUBLIC_KEY);
 
     let response = keycard.select().expect("SELECT failed");
     assert!(
@@ -85,7 +94,7 @@ fn full_sign_flow() {
     // 1. Connect and select
     let channel = PcscChannel::connect().expect("failed to connect to card via PC/SC");
     let channel = LoggingChannel::new(channel);
-    let mut keycard = KeycardCommandSet::new(channel);
+    let mut keycard = KeycardCommandSet::new_with_ca(channel, TEST_CA_PUBLIC_KEY);
     let resp = keycard.select().expect("SELECT failed");
     assert!(resp.is_ok(), "SELECT failed: {:02X} {:02X}", resp.sw1(), resp.sw2());
 
@@ -109,7 +118,7 @@ fn full_sign_flow() {
 
     // 4. Verify PIN
     let pin_resp = keycard
-        .verify_pin("123456")
+        .verify_pin("000000")
         .expect("verify_pin failed");
     assert!(
         pin_resp.is_ok(),
@@ -118,10 +127,22 @@ fn full_sign_flow() {
         pin_resp.sw2()
     );
 
-    // 5. Skip signing if no master key is loaded
+    // 5. Load a test master key if none is present
     if !has_master_key {
-        eprintln!("no master key loaded, skipping sign/verify");
-        return;
+        // BIP39 test vector mnemonic (12 words)
+        const TEST_MNEMONIC: &str =
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let seed = Mnemonic::binary_seed_from_phrase(TEST_MNEMONIC, "");
+        let load_resp = keycard
+            .load_key(&seed)
+            .expect("load_key failed");
+        assert!(
+            load_resp.is_ok(),
+            "load_key failed: {:02X} {:02X}",
+            load_resp.sw1(),
+            load_resp.sw2()
+        );
+        eprintln!("loaded test master key from mnemonic");
     }
 
     // 6. Export the public key at the Ethereum wallet path
