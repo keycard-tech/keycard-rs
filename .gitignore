@@ -1,0 +1,25 @@
+# Dependencies
+/target
+**/target
+Cargo.lock
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Rust analyzer
+.rust-analyzer/
+
+# Build artifacts
+debug/
+release/
+
+# Generated docs
+/doc
+
+# Environment files
+.env
+.env.*

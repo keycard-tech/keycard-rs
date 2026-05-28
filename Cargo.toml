@@ -1,0 +1,32 @@
+[package]
+name = "keycard-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust port of the Status Keycard Java library"
+license = "MIT"
+
+[features]
+default = ["pcsc"]
+pcsc = ["dep:pcsc"]
+
+[dependencies]
+aes = "0.9"
+cbc = "0.2"
+ccm = "0.6.0-rc.3"
+hkdf = "0.13"
+hmac = "0.13"
+sha2 = "0.11"
+k256 = { version = "0.14.0-rc.9", features = ["ecdsa", "arithmetic", "ecdh"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+pbkdf2 = "0.13"
+sha3 = "0.12"
+thiserror = "1"
+typenum = "1.17"
+base64 = "0.21"
+getrandom = "0.2"
+getrandom_04 = { package = "getrandom", version = "0.4" }
+generic-array = "0.14"
+pcsc = { version = "2", optional = true }
+
+[dev-dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }
