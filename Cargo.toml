@@ -27,6 +27,7 @@ getrandom = "0.2"
 getrandom_04 = { package = "getrandom", version = "0.4" }
 generic-array = "0.14"
 pcsc = { version = "2", optional = true }
+zeroize = "1"
 
 [dev-dependencies]
 rand_core = { version = "0.6", features = ["getrandom"] }

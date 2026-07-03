@@ -15,15 +15,24 @@ use crate::tlv::{BerTlvReader, TLV_CERT, TLV_SIGNATURE_TEMPLATE};
 #[derive(Debug, Clone)]
 pub struct Certificate {
     ident_pub: [u8; 33],
-    // RecoverableSignature fields (embedded)
-    public_key: Vec<u8>,
-    rec_id: i32,
-    r: Vec<u8>,
-    s: Vec<u8>,
+    signature: RecoverableSignature,
+}
+
+/// Parses SEC1-encoded public key bytes into a `VerifyingKey`.
+///
+/// Shared by `Certificate::verify_identity` and
+/// `SecureChannelV2::verify_card_signature`, which both need to go from raw
+/// identity public key bytes to something that can verify a signature.
+pub(crate) fn parse_verifying_key(pubkey_bytes: &[u8]) -> Result<VerifyingKey, Error> {
+    let point = Sec1Point::from_bytes(pubkey_bytes)
+        .map_err(|_| Error::Crypto("Invalid identity public key encoding".to_string()))?;
+    VerifyingKey::from_sec1_point(&point)
+        .map_err(|_| Error::Crypto("Invalid identity public key".to_string()))
 }
 
 impl Certificate {
-    /// Parses a 98-byte certificate from card data.
+    /// Parses a certificate from card data (at least 98 bytes; anything
+    /// beyond the first 98 is ignored).
     ///
     /// Format: `compressed_pubkey(33) || r(32) || s(32) || v(1)`
     ///
@@ -32,7 +41,7 @@ impl Certificate {
     pub fn from_tlv(cert_data: &[u8]) -> Result<Self, Error> {
         if cert_data.len() < 98 {
             return Err(Error::Tlv(format!(
-                "Certificate data too short: expected 98 bytes, got {}",
+                "Certificate data too short: expected at least 98 bytes, got {}",
                 cert_data.len()
             )));
         }
@@ -43,7 +52,7 @@ impl Certificate {
         let rec_id = cert_data[97] as i32;
 
         // Hash the compressed public key
-        let hash = Sha256::digest(&ident_pub);
+        let hash = Sha256::digest(ident_pub);
 
         // Recover CA public key from signature
         let ca_pub = RecoverableSignature::recover_public_key(rec_id, &hash, &r, &s, true)
@@ -51,10 +60,7 @@ impl Certificate {
 
         Ok(Self {
             ident_pub,
-            public_key: ca_pub,
-            rec_id,
-            r,
-            s,
+            signature: RecoverableSignature::from_components(ca_pub, r, s, rec_id),
         })
     }
 
@@ -65,19 +71,19 @@ impl Certificate {
 
     /// Returns the recovered CA public key.
     pub fn public_key(&self) -> &[u8] {
-        &self.public_key
+        self.signature.public_key()
     }
 
     pub fn rec_id(&self) -> i32 {
-        self.rec_id
+        self.signature.rec_id()
     }
 
     pub fn r(&self) -> &[u8] {
-        &self.r
+        self.signature.r()
     }
 
     pub fn s(&self) -> &[u8] {
-        &self.s
+        self.signature.s()
     }
 
     /// Verifies a signed identity proof.
@@ -123,18 +129,13 @@ impl Certificate {
         };
 
         // Verify using the card's identity public key
-        let ident_point = Sec1Point::from_bytes(&cert.ident_pub).map_err(|_| {
-            Error::Crypto("Invalid identity public key encoding".to_string())
-        })?;
-        let verifying_key = VerifyingKey::from_sec1_point(&ident_point).map_err(|_| {
-            Error::Crypto("Invalid identity public key".to_string())
-        })?;
+        let verifying_key = parse_verifying_key(cert.ident_pub())?;
 
         verifying_key.verify_prehash(hash, &sig).map_err(|_| {
             Error::Crypto("Identity signature verification failed".to_string())
         })?;
 
-        Ok(cert.public_key.clone())
+        Ok(cert.public_key().to_vec())
     }
 }
 

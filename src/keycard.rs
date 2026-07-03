@@ -4,6 +4,8 @@
 //! transport and a `SecureChannel` implementation to send APDU commands to the
 //! Keycard applet.
 
+use std::str::FromStr;
+
 use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
 
@@ -150,7 +152,7 @@ impl KeycardCommandSet {
         if resp.sw() == ApduResponse::SW_OK {
             self.info = Some(ApplicationInfo::from_tlv(resp.data())?);
 
-            if self.info.as_ref().map_or(false, |i| i.has_secure_channel()) {
+            if self.info.as_ref().is_some_and(|i| i.has_secure_channel()) {
                 if Self::is_secure_channel_v2(self.info.as_ref().unwrap()) {
                     let mut sc_v2 = SecureChannelV2::new(
                         self.ca_public_keys.clone(),
@@ -284,18 +286,20 @@ impl KeycardCommandSet {
     // APDU commands — Card identification
     // -----------------------------------------------------------------------
 
+    /// Wraps `data` in the secure channel (CLA 0x80) and transmits it.
+    ///
+    /// Every protected command shares this shape; this just avoids repeating
+    /// the `protected_command` + `transmit` pair at every call site below.
+    fn send_protected(&mut self, ins: u8, p1: u8, p2: u8, data: &[u8]) -> Result<ApduResponse, Error> {
+        let cmd = self.secure_channel.protected_command(0x80, ins, p1, p2, data)?;
+        self.secure_channel.transmit(&mut *self.channel, &cmd)
+    }
+
     /// Sends an IDENTIFY CARD APDU.
     ///
     /// The challenge must be 32 bytes long.
     pub fn identify_card(&mut self, challenge: &[u8]) -> Result<ApduResponse, Error> {
-        let cmd = self.secure_channel.protected_command(
-            0x80,
-            ins::IDENTIFY_CARD,
-            0,
-            0,
-            challenge,
-        );
-        self.secure_channel.transmit(&mut *self.channel, &cmd)
+        self.send_protected(ins::IDENTIFY_CARD, 0, 0, challenge)
     }
 
     // -----------------------------------------------------------------------
@@ -307,8 +311,7 @@ impl KeycardCommandSet {
     /// # Arguments
     /// * `info` — The P1 parameter (use `get_status_p1::APPLICATION` or `KEY_PATH`).
     pub fn get_status(&mut self, info: u8) -> Result<ApduResponse, Error> {
-        let cmd = self.secure_channel.protected_command(0x80, ins::GET_STATUS, info, 0, &[]);
-        self.secure_channel.transmit(&mut *self.channel, &cmd)
+        self.send_protected(ins::GET_STATUS, info, 0, &[])
     }
 
     // -----------------------------------------------------------------------
@@ -317,14 +320,7 @@ impl KeycardCommandSet {
 
     /// Sends a VERIFY PIN APDU.
     pub fn verify_pin(&mut self, pin: &str) -> Result<ApduResponse, Error> {
-        let cmd = self.secure_channel.protected_command(
-            0x80,
-            ins::VERIFY_PIN,
-            0,
-            0,
-            pin.as_bytes(),
-        );
-        self.secure_channel.transmit(&mut *self.channel, &cmd)
+        self.send_protected(ins::VERIFY_PIN, 0, 0, pin.as_bytes())
     }
 
     /// Sends a CHANGE PIN APDU to change the user PIN.
@@ -347,8 +343,7 @@ impl KeycardCommandSet {
 
     /// Sends a CHANGE PIN APDU with explicit pin type.
     pub fn change_pin_with_type(&mut self, pin_type: u8, pin: &[u8]) -> Result<ApduResponse, Error> {
-        let cmd = self.secure_channel.protected_command(0x80, ins::CHANGE_PIN, pin_type, 0, pin);
-        self.secure_channel.transmit(&mut *self.channel, &cmd)
+        self.send_protected(ins::CHANGE_PIN, pin_type, 0, pin)
     }
 
     /// Sends an UNBLOCK PIN APDU.
@@ -357,8 +352,7 @@ impl KeycardCommandSet {
     pub fn unblock_pin(&mut self, puk: &str, new_pin: &str) -> Result<ApduResponse, Error> {
         let mut data = puk.as_bytes().to_vec();
         data.extend_from_slice(new_pin.as_bytes());
-        let cmd = self.secure_channel.protected_command(0x80, ins::UNBLOCK_PIN, 0, 0, &data);
-        self.secure_channel.transmit(&mut *self.channel, &cmd)
+        self.send_protected(ins::UNBLOCK_PIN, 0, 0, &data)
     }
 
     // -----------------------------------------------------------------------
@@ -403,8 +397,7 @@ impl KeycardCommandSet {
 
     /// Sends a LOAD KEY APDU with raw data and explicit key type (P1).
     pub fn load_key_raw(&mut self, data: &[u8], key_type: u8) -> Result<ApduResponse, Error> {
-        let cmd = self.secure_channel.protected_command(0x80, ins::LOAD_KEY, key_type, 0, data);
-        self.secure_channel.transmit(&mut *self.channel, &cmd)
+        self.send_protected(ins::LOAD_KEY, key_type, 0, data)
     }
 
     /// Sends a GENERATE MNEMONIC APDU.
@@ -412,26 +405,17 @@ impl KeycardCommandSet {
     /// # Arguments
     /// * `cs` — The P1 parameter (use `generate_mnemonic::WORDS_12`, etc.).
     pub fn generate_mnemonic(&mut self, cs: u8) -> Result<ApduResponse, Error> {
-        let cmd = self.secure_channel.protected_command(
-            0x80,
-            ins::GENERATE_MNEMONIC,
-            cs,
-            0,
-            &[],
-        );
-        self.secure_channel.transmit(&mut *self.channel, &cmd)
+        self.send_protected(ins::GENERATE_MNEMONIC, cs, 0, &[])
     }
 
     /// Sends a REMOVE KEY APDU.
     pub fn remove_key(&mut self) -> Result<ApduResponse, Error> {
-        let cmd = self.secure_channel.protected_command(0x80, ins::REMOVE_KEY, 0, 0, &[]);
-        self.secure_channel.transmit(&mut *self.channel, &cmd)
+        self.send_protected(ins::REMOVE_KEY, 0, 0, &[])
     }
 
     /// Sends a GENERATE KEY APDU.
     pub fn generate_key(&mut self) -> Result<ApduResponse, Error> {
-        let cmd = self.secure_channel.protected_command(0x80, ins::GENERATE_KEY, 0, 0, &[]);
-        self.secure_channel.transmit(&mut *self.channel, &cmd)
+        self.send_protected(ins::GENERATE_KEY, 0, 0, &[])
     }
 
     // -----------------------------------------------------------------------
@@ -493,8 +477,7 @@ impl KeycardCommandSet {
 
     /// Sends a SIGN APDU with raw data and explicit P1/P2.
     pub fn sign_raw(&mut self, data: &[u8], p1: u8, p2: u8) -> Result<ApduResponse, Error> {
-        let cmd = self.secure_channel.protected_command(0x80, ins::SIGN, p1, p2, data);
-        self.secure_channel.transmit(&mut *self.channel, &cmd)
+        self.send_protected(ins::SIGN, p1, p2, data)
     }
 
     // -----------------------------------------------------------------------
@@ -518,8 +501,7 @@ impl KeycardCommandSet {
         data: &[u8],
         source: u8,
     ) -> Result<ApduResponse, Error> {
-        let cmd = self.secure_channel.protected_command(0x80, ins::DERIVE_KEY, source, 0, data);
-        self.secure_channel.transmit(&mut *self.channel, &cmd)
+        self.send_protected(ins::DERIVE_KEY, source, 0, data)
     }
 
     // -----------------------------------------------------------------------
@@ -544,14 +526,7 @@ impl KeycardCommandSet {
 
     /// Sets the pinless path from raw data.
     pub fn set_pinless_path_raw(&mut self, data: &[u8]) -> Result<ApduResponse, Error> {
-        let cmd = self.secure_channel.protected_command(
-            0x80,
-            ins::SET_PINLESS_PATH,
-            0,
-            0,
-            data,
-        );
-        self.secure_channel.transmit(&mut *self.channel, &cmd)
+        self.send_protected(ins::SET_PINLESS_PATH, 0, 0, data)
     }
 
     // -----------------------------------------------------------------------
@@ -610,8 +585,7 @@ impl KeycardCommandSet {
             } else {
                 export_key_p1::DERIVE
             };
-        let cmd = self.secure_channel.protected_command(0x80, ins::EXPORT_KEY, p1, p2, keypath);
-        self.secure_channel.transmit(&mut *self.channel, &cmd)
+        self.send_protected(ins::EXPORT_KEY, p1, p2, keypath)
     }
 
     /// Exports an LEE key at the given BIP32 path.
@@ -626,8 +600,7 @@ impl KeycardCommandSet {
         path: &[u8],
         source: u8,
     ) -> Result<ApduResponse, Error> {
-        let cmd = self.secure_channel.protected_command(0x80, ins::EXPORT_LEE, source, 0, path);
-        self.secure_channel.transmit(&mut *self.channel, &cmd)
+        self.send_protected(ins::EXPORT_LEE, source, 0, path)
     }
 
     // -----------------------------------------------------------------------
@@ -636,14 +609,7 @@ impl KeycardCommandSet {
 
     /// Sends a GET DATA APDU.
     pub fn get_data(&mut self, data_type: u8) -> Result<ApduResponse, Error> {
-        let cmd = self.secure_channel.protected_command(
-            0x80,
-            ins::GET_DATA,
-            data_type,
-            0,
-            &[],
-        );
-        self.secure_channel.transmit(&mut *self.channel, &cmd)
+        self.send_protected(ins::GET_DATA, data_type, 0, &[])
     }
 
     /// Sends a GET CHALLENGE APDU.
@@ -651,14 +617,7 @@ impl KeycardCommandSet {
     /// # Arguments
     /// * `len` — Requested challenge length.
     pub fn get_challenge(&mut self, len: u8) -> Result<ApduResponse, Error> {
-        let cmd = self.secure_channel.protected_command(
-            0x80,
-            ins::GET_CHALLENGE,
-            len,
-            0,
-            &[],
-        );
-        self.secure_channel.transmit(&mut *self.channel, &cmd)
+        self.send_protected(ins::GET_CHALLENGE, len, 0, &[])
     }
 
     /// Sends a STORE DATA APDU (offset 0).
@@ -679,14 +638,7 @@ impl KeycardCommandSet {
         data_type: u8,
         offset: u16,
     ) -> Result<ApduResponse, Error> {
-        let cmd = self.secure_channel.protected_command(
-            0x80,
-            ins::STORE_DATA,
-            data_type,
-            (offset / 4) as u8,
-            data,
-        );
-        self.secure_channel.transmit(&mut *self.channel, &cmd)
+        self.send_protected(ins::STORE_DATA, data_type, (offset / 4) as u8, data)
     }
 
     /// Sends a SET NDEF APDU.
@@ -697,7 +649,7 @@ impl KeycardCommandSet {
         let app_major = self
             .info
             .as_ref()
-            .map(|i| (i.app_version() >> 8) as u16)
+            .map(|i| i.app_version() >> 8)
             .unwrap_or(0);
 
         if app_major > 2 {
@@ -735,14 +687,7 @@ impl KeycardCommandSet {
                 Error::Protocol("NDEF write completed with no responses".to_string())
             })
         } else {
-            let cmd = self.secure_channel.protected_command(
-                0x80,
-                ins::SET_NDEF,
-                0,
-                0,
-                ndef,
-            );
-            self.secure_channel.transmit(&mut *self.channel, &cmd)
+            self.send_protected(ins::SET_NDEF, 0, 0, ndef)
         }
     }
 
@@ -809,17 +754,9 @@ impl KeycardCommandSet {
         }
 
         // V2: open secure channel first, then send INIT as encrypted command
-        if let Some(sc_v2) = self.secure_channel.as_any().downcast_ref::<SecureChannelV2>() {
-            let _ = sc_v2; // just checking type
+        if self.secure_channel.as_any().is::<SecureChannelV2>() {
             self.auto_open_secure_channel()?;
-            let cmd = self.secure_channel.protected_command(
-                0x80,
-                ins::INIT,
-                0,
-                0,
-                &init_data,
-            );
-            self.secure_channel.transmit(&mut *self.channel, &cmd)
+            self.send_protected(ins::INIT, 0, 0, &init_data)
         } else {
             // V1: use one-shot encryption
             let encrypted = self

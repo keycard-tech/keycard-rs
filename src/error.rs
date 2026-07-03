@@ -85,6 +85,14 @@ pub enum Error {
     InvalidArgument(String),
 }
 
+impl Error {
+    /// Wraps a transport/OS-level failure (e.g. from `getrandom` or `pcsc`)
+    /// as an `Error::Io` with `ErrorKind::Other`.
+    pub fn io_other(source: impl std::fmt::Display) -> Self {
+        Error::Io(io::Error::other(source.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

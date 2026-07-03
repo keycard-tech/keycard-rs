@@ -36,21 +36,9 @@ impl RecoverableSignature {
         let mut reader = BerTlvReader::new(tlv_data);
 
         if reader.next_tag_is(TLV_RAW_SIGNATURE) {
-            let _tag = reader.read_tag().map_err(|e| {
-                Error::Tlv(format!("Failed to read signature tag: {}", e))
+            let value = reader.read_primitive(TLV_RAW_SIGNATURE).map_err(|e| {
+                Error::Tlv(format!("Failed to read raw signature: {}", e))
             })?;
-            let len = reader.read_length().map_err(|e| {
-                Error::Tlv(format!("Failed to read raw signature length: {}", e))
-            })?;
-            if reader.pos() + len > reader.len() {
-                return Err(Error::Tlv(format!(
-                    "Not enough data for raw signature: need {} bytes, have {}",
-                    len,
-                    reader.len() - reader.pos()
-                )));
-            }
-            let value = reader.buffer()[reader.pos()..reader.pos() + len].to_vec();
-            reader.advance(len);
             Self::init_from_raw_signature(hash, &value)
         } else if reader.next_tag_is(TLV_SIGNATURE_TEMPLATE) {
             Self::init_from_legacy(hash, &mut reader)
@@ -139,9 +127,12 @@ impl RecoverableSignature {
     }
 
     /// Direct construction from components.
+    ///
+    /// `public_key` is stored as given — the caller is responsible for
+    /// providing it in whichever encoding (compressed or uncompressed) they
+    /// want it in.
     pub fn from_components(
         public_key: Vec<u8>,
-        _compressed: bool,
         r: Vec<u8>,
         s: Vec<u8>,
         rec_id: i32,
@@ -193,7 +184,7 @@ impl RecoverableSignature {
         s: &[u8],
         compressed: bool,
     ) -> Option<Vec<u8>> {
-        if rec_id < 0 || rec_id > 3 {
+        if !(0..=3).contains(&rec_id) {
             return None;
         }
 
@@ -263,7 +254,7 @@ mod tests {
         let pk_bytes = affine.to_sec1_point(false).to_bytes().to_vec();
 
         // Sign the hash
-        let (sig, recovery_id) = signing_key.sign_prehash_recoverable(&hash).unwrap();
+        let (sig, recovery_id) = signing_key.sign_prehash_recoverable(&hash);
         let sig_bytes = sig.to_bytes();
         let r: Vec<u8> = sig_bytes[..32].to_vec();
         let s: Vec<u8> = sig_bytes[32..].to_vec();
@@ -297,7 +288,7 @@ mod tests {
         // Generate a key pair and sign
         let mut rng = getrandom_04::SysRng;
         let signing_key = SigningKey::try_generate_from_rng(&mut rng).unwrap();
-        let (sig, recovery_id) = signing_key.sign_prehash_recoverable(&hash).unwrap();
+        let (sig, recovery_id) = signing_key.sign_prehash_recoverable(&hash);
         let sig_bytes = sig.to_bytes();
 
         // Build raw signature TLV: tag 0x80, length 65, r || s || rec_id
@@ -331,7 +322,7 @@ mod tests {
         let public_key = PublicKey::from(pk);
         let affine: AffinePoint = public_key.into();
         let pk_bytes = affine.to_sec1_point(false).to_bytes().to_vec();
-        let (sig, _recovery_id) = signing_key.sign_prehash_recoverable(&hash).unwrap();
+        let (sig, _recovery_id) = signing_key.sign_prehash_recoverable(&hash);
         let sig_bytes = sig.to_bytes();
         let r_bytes: [u8; 32] = sig_bytes[..32].try_into().unwrap();
         let s_bytes: [u8; 32] = sig_bytes[32..].try_into().unwrap();
@@ -392,7 +383,7 @@ mod tests {
         let public_key = PublicKey::from(pk);
         let affine: AffinePoint = public_key.into();
         let pk_bytes = affine.to_sec1_point(false).to_bytes().to_vec();
-        let (sig, _recovery_id) = signing_key.sign_prehash_recoverable(&hash).unwrap();
+        let (sig, _recovery_id) = signing_key.sign_prehash_recoverable(&hash);
         let sig_bytes = sig.to_bytes();
         let r_bytes: [u8; 32] = sig_bytes[..32].try_into().unwrap();
         let s_bytes: [u8; 32] = sig_bytes[32..].try_into().unwrap();

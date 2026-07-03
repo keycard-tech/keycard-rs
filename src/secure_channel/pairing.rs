@@ -2,6 +2,7 @@
 
 use crate::error::Error;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use zeroize::Zeroize;
 
 /// Pairing data stored on the client side for Secure Channel V1.
 #[derive(Debug, Clone)]
@@ -65,6 +66,17 @@ impl Pairing {
     /// Returns the pairing slot index.
     pub fn pairing_index(&self) -> u8 {
         self.pairing_index
+    }
+}
+
+impl Drop for Pairing {
+    /// Scrubs the pairing key from memory. This is a long-lived secret (it
+    /// outlives any single secure-channel session and is often persisted by
+    /// the caller across app restarts via `to_base64`), so it's worth
+    /// clearing explicitly rather than relying on the allocator to reuse
+    /// the memory eventually.
+    fn drop(&mut self) {
+        self.pairing_key.zeroize();
     }
 }
 

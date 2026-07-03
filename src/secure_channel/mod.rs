@@ -85,8 +85,12 @@ pub trait SecureChannel {
     ) -> Result<ApduResponse, Error>;
 
     /// Returns a command APDU with the secure channel wrapper applied.
+    ///
+    /// Returns `Err` if the channel was previously established but is not
+    /// currently open (e.g. after a transmit failure) — the caller must call
+    /// `auto_open` again rather than silently falling back to plaintext.
     fn protected_command(&mut self, cla: u8, ins: u8, p1: u8, p2: u8, data: &[u8])
-        -> ApduCommand;
+        -> Result<ApduCommand, Error>;
 
     /// Transmits a protected command APDU and unwraps the response.
     fn transmit(

@@ -10,19 +10,19 @@ use ccm::{
 };
 use hkdf::Hkdf;
 use k256::{
-    AffinePoint, Sec1Point, PublicKey,
+    AffinePoint, PublicKey,
     ecdh::EphemeralSecret,
-    ecdsa::{Signature, VerifyingKey, signature::hazmat::PrehashVerifier},
+    ecdsa::{Signature, signature::hazmat::PrehashVerifier},
     elliptic_curve::sec1::ToSec1Point,
 };
 use sha2::{Digest, Sha256};
-
+use zeroize::Zeroize;
 
 use crate::apdu::{ApduCommand, ApduResponse};
 use crate::channel::CardChannel;
 use crate::constants::ins;
 use crate::error::Error;
-use crate::parsing::certificate::Certificate;
+use crate::parsing::certificate::{parse_verifying_key, Certificate};
 use crate::secure_channel::{SecureChannel, SecureChannelVersion, Pairing};
 
 type Aes128Ccm = Ccm<Aes128, typenum::consts::U8, typenum::consts::U13>;
@@ -50,14 +50,26 @@ pub struct SecureChannelV2 {
     key_h2c: Option<[u8; AES_KEY_SIZE]>,
     /// Card-to-client AES-128-CCM key.
     key_c2h: Option<[u8; AES_KEY_SIZE]>,
-    /// Per-session nonce counter (big-endian, starts at 0).
+    /// Per-session nonce counter (big-endian, starts at 0). Holds the nonce
+    /// to use for the *next* encryption; advanced as soon as a nonce is
+    /// consumed by `protected_command`, before the round trip completes.
     nonce_counter: [u8; CCM_NONCE_SIZE],
+    /// The nonce used to encrypt the in-flight command, saved so the
+    /// matching response can be decrypted with it even though
+    /// `nonce_counter` has already advanced past it.
+    pending_decrypt_nonce: Option<[u8; CCM_NONCE_SIZE]>,
     /// Whether the session is active.
     open: bool,
+    /// Whether the channel has ever been successfully opened.
+    ///
+    /// Distinct from `open`: this stays `true` across a transmit failure so
+    /// that `protected_command` knows to refuse (rather than silently send
+    /// plaintext, or worse, re-encrypt under a reused CCM nonce) once the
+    /// session has previously carried protected traffic. Only `reset()`
+    /// clears it, since that's the only deliberate teardown.
+    established: bool,
     /// Card's identity public key (set during certificate validation).
     card_ident_pub: Option<[u8; 33]>,
-    /// Client's ephemeral public key (for debugging).
-    client_eph_pub: Option<Vec<u8>>,
 }
 
 impl SecureChannelV2 {
@@ -73,9 +85,10 @@ impl SecureChannelV2 {
             key_h2c: None,
             key_c2h: None,
             nonce_counter: [0u8; CCM_NONCE_SIZE],
+            pending_decrypt_nonce: None,
             open: false,
+            established: false,
             card_ident_pub: None,
-            client_eph_pub: None,
         }
     }
 
@@ -83,7 +96,7 @@ impl SecureChannelV2 {
     /// and validates the CA public key against the known anchors.
     pub fn set_card_certificate(&mut self, cert_data: &[u8]) -> Result<(), Error> {
         let cert = Certificate::from_tlv(cert_data)?;
-        let ident_pub = cert.ident_pub().clone();
+        let ident_pub = *cert.ident_pub();
         self.card_ident_pub = Some(ident_pub);
 
         // Check if the card's identity public key is whitelisted
@@ -133,7 +146,7 @@ impl SecureChannel for SecureChannelV2 {
         // Generate random salt
         let mut salt = [0u8; HKDF_SALT_SIZE];
         getrandom::getrandom(&mut salt)
-            .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+            .map_err(Error::io_other)?;
 
         // Generate client ephemeral key pair
         use k256::elliptic_curve::Generate;
@@ -143,7 +156,6 @@ impl SecureChannel for SecureChannelV2 {
         let client_eph_pub = client_eph_priv.public_key();
         let affine: AffinePoint = client_eph_pub.into();
         let client_eph_pub_bytes = affine.to_sec1_point(false).to_bytes().to_vec(); // uncompressed
-        self.client_eph_pub = Some(client_eph_pub_bytes.clone());
 
         // Build request: salt || client_eph_pub (uncompressed)
         let mut request_data = Vec::with_capacity(HKDF_SALT_SIZE + PUBKEY_SIZE);
@@ -230,9 +242,20 @@ impl SecureChannel for SecureChannelV2 {
         p1: u8,
         p2: u8,
         data: &[u8],
-    ) -> ApduCommand {
+    ) -> Result<ApduCommand, Error> {
         if !self.open {
-            return ApduCommand::new(cla, ins, p1, p2, data.to_vec());
+            if self.established {
+                return Err(Error::Protocol(
+                    "Secure channel was closed after an error; call auto_open again before sending protected commands".to_string(),
+                ));
+            }
+            return Ok(ApduCommand::new(cla, ins, p1, p2, data.to_vec()));
+        }
+
+        if data.len() > u8::MAX as usize {
+            return Err(Error::InvalidArgument(format!(
+                "Protected command payload too large: {} bytes", data.len()
+            )));
         }
 
         // Build inner APDU: CLA | INS | P1 | P2 | LC | data
@@ -244,11 +267,18 @@ impl SecureChannel for SecureChannelV2 {
         inner.push(data.len() as u8);
         inner.extend_from_slice(data);
 
-        // Encrypt with AES-128-CCM
+        // Encrypt with AES-128-CCM using the current nonce, then advance the
+        // counter immediately — before we know whether the round trip to
+        // the card will even complete. Once a nonce has been used to
+        // encrypt a command it must never be reused, so the advance cannot
+        // wait for a successful response. The nonce just consumed is saved
+        // so `transmit` can decrypt the matching response with it.
         let ciphertext = self.encrypt_ccm(&inner)
-            .expect("AES-CCM encryption failed");
+            .map_err(|_| Error::Crypto("AES-CCM encryption failed".to_string()))?;
+        self.pending_decrypt_nonce = Some(self.nonce_counter);
+        self.increment_nonce();
 
-        ApduCommand::new(0x80, ins::SECURED_APDU, 0, 0, ciphertext)
+        Ok(ApduCommand::new(0x80, ins::SECURED_APDU, 0, 0, ciphertext))
     }
 
     fn transmit(
@@ -256,7 +286,22 @@ impl SecureChannel for SecureChannelV2 {
         channel: &mut dyn CardChannel,
         cmd: &ApduCommand,
     ) -> Result<ApduResponse, Error> {
-        let resp = channel.send(cmd)?;
+        // Whether or not this exchange succeeds, the nonce it used must
+        // never be handed to `decrypt_ccm` again — consume it now.
+        let nonce_for_decrypt = self.pending_decrypt_nonce.take();
+
+        let resp = match channel.send(cmd) {
+            Ok(resp) => resp,
+            Err(e) => {
+                // The nonce used to encrypt `cmd` was already consumed by
+                // `protected_command`, so no reuse risk here — but we can't
+                // know whether the card actually received/processed the
+                // command, so the session state is unknown. Close it and
+                // force the caller to re-establish before retrying.
+                self.open = false;
+                return Err(e);
+            }
+        };
 
         if resp.sw() != ApduResponse::SW_OK {
             self.open = false;
@@ -267,14 +312,25 @@ impl SecureChannel for SecureChannelV2 {
             return Ok(resp);
         }
 
-        // Decrypt with AES-128-CCM
-        let plaintext = self.decrypt_ccm(resp.data())
-            .map_err(|_| Error::Protocol("AES-CCM decryption failed".to_string()))?;
+        let nonce_for_decrypt = nonce_for_decrypt.ok_or_else(|| {
+            self.open = false;
+            Error::Protocol("No pending nonce for decryption".to_string())
+        })?;
 
-        // Increment nonce counter
-        self.increment_nonce();
+        // Decrypt with AES-128-CCM, using the nonce saved by
+        // `protected_command` for this exact exchange (the counter has
+        // already moved on to the next one). A decrypt failure here cannot
+        // lead to nonce reuse, but it does mean either transport corruption
+        // or tampering, so close the session rather than leave it open.
+        let plaintext = match self.decrypt_ccm(resp.data(), &nonce_for_decrypt) {
+            Ok(plaintext) => plaintext,
+            Err(_) => {
+                self.open = false;
+                return Err(Error::Protocol("AES-CCM decryption failed".to_string()));
+            }
+        };
 
-        Ok(ApduResponse::new(&plaintext)?)
+        ApduResponse::new(&plaintext)
     }
 
     fn pairing(&self) -> Option<&Pairing> {
@@ -287,11 +343,18 @@ impl SecureChannel for SecureChannelV2 {
 
     fn reset(&mut self) {
         self.open = false;
+        self.established = false;
+        // Zeroize before dropping: a plain `= None` assignment also
+        // overwrites the key bytes, but the compiler is free to elide that
+        // as a dead store since the old value is never read again —
+        // `zeroize()` uses a volatile write that can't be optimized away.
+        self.key_h2c.zeroize();
+        self.key_c2h.zeroize();
         self.key_h2c = None;
         self.key_c2h = None;
         self.nonce_counter = [0u8; CCM_NONCE_SIZE];
+        self.pending_decrypt_nonce = None;
         self.card_ident_pub = None;
-        self.client_eph_pub = None;
     }
 
     fn version(&self) -> SecureChannelVersion {
@@ -332,7 +395,7 @@ impl SecureChannelV2 {
         let shared_secret = shared.raw_secret_bytes();
 
         // HKDF-SHA256 key derivation
-        let okm = hkdf_derive(salt, shared_secret, PROTOCOL_LABEL, OKM_SIZE)
+        let mut okm = hkdf_derive(salt, shared_secret, PROTOCOL_LABEL, OKM_SIZE)
             .map_err(|_| Error::Crypto("HKDF derivation failed".to_string()))?;
 
         // Set session keys
@@ -340,6 +403,9 @@ impl SecureChannelV2 {
         let mut key_c2h = [0u8; AES_KEY_SIZE];
         key_h2c.copy_from_slice(&okm[0..AES_KEY_SIZE]);
         key_c2h.copy_from_slice(&okm[AES_KEY_SIZE..OKM_SIZE]);
+        // okm holds both keys concatenated; scrub it now that they've been
+        // split into their own (zeroize-on-drop) fields.
+        okm.zeroize();
         self.key_h2c = Some(key_h2c);
         self.key_c2h = Some(key_c2h);
 
@@ -349,6 +415,7 @@ impl SecureChannelV2 {
         // Initialize nonce counter to zero
         self.nonce_counter = [0u8; CCM_NONCE_SIZE];
         self.open = true;
+        self.established = true;
 
         Ok(())
     }
@@ -382,10 +449,7 @@ impl SecureChannelV2 {
             .map_err(|_| Error::Crypto("Failed to parse card signature DER".to_string()))?;
 
         // Verify using the card's identity public key
-        let ident_point = Sec1Point::from_bytes(card_ident_pub)
-            .map_err(|_| Error::Crypto("Invalid identity public key encoding".to_string()))?;
-        let verifying_key = VerifyingKey::from_sec1_point(&ident_point)
-            .map_err(|_| Error::Crypto("Invalid identity public key".to_string()))?;
+        let verifying_key = parse_verifying_key(card_ident_pub)?;
 
         verifying_key
             .verify_prehash(&transcript_hash, &sig)
@@ -410,14 +474,17 @@ impl SecureChannelV2 {
         Ok(ciphertext)
     }
 
-    /// Decrypts ciphertext with AES-128-CCM using the card-to-client key.
-    fn decrypt_ccm(&self, ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
+    /// Decrypts ciphertext with AES-128-CCM using the card-to-client key
+    /// and the given nonce (the nonce that was used to encrypt the
+    /// corresponding outgoing command, not necessarily the current
+    /// `nonce_counter`, which may have already advanced).
+    fn decrypt_ccm(&self, ciphertext: &[u8], nonce_bytes: &[u8; CCM_NONCE_SIZE]) -> Result<Vec<u8>, Error> {
         let key = self.key_c2h.as_ref()
             .ok_or_else(|| Error::Protocol("No card-to-client key available".to_string()))?;
         let cipher = Aes128Ccm::new_from_slice(key)
             .map_err(|_| Error::Crypto("Failed to create AES-CCM cipher".to_string()))?;
 
-        let nonce = ccm::aead::Nonce::<Aes128Ccm>::try_from(&self.nonce_counter[..])
+        let nonce = ccm::aead::Nonce::<Aes128Ccm>::try_from(&nonce_bytes[..])
             .map_err(|_| Error::Crypto("Invalid nonce".to_string()))?;
         let plaintext = cipher
             .decrypt(&nonce, ciphertext)
@@ -436,6 +503,13 @@ impl SecureChannelV2 {
         }
         // Overflow — session must be reset
         self.open = false;
+    }
+}
+
+impl Drop for SecureChannelV2 {
+    fn drop(&mut self) {
+        self.key_h2c.zeroize();
+        self.key_c2h.zeroize();
     }
 }
 
@@ -516,5 +590,144 @@ mod tests {
         assert!(sc.is_card_whitelisted(&card_key));
         let other: [u8; 33] = [0x04u8; 33];
         assert!(!sc.is_card_whitelisted(&other));
+    }
+
+    #[test]
+    fn test_v2_protected_command_plaintext_before_established() {
+        let mut sc = SecureChannelV2::new(vec![], vec![]);
+        let cmd = sc.protected_command(0x80, 0xF2, 0x00, 0x00, &[0x01]).unwrap();
+        assert_eq!(cmd.cla(), 0x80);
+        assert_eq!(cmd.ins(), 0xF2);
+        assert_eq!(cmd.data(), &[0x01]);
+    }
+
+    #[test]
+    fn test_v2_protected_command_errors_after_established_and_closed() {
+        let mut sc = SecureChannelV2::new(vec![], vec![]);
+        sc.established = true;
+        sc.open = false;
+        assert!(sc.protected_command(0x80, 0xF2, 0x00, 0x00, &[]).is_err());
+    }
+
+    /// Regression test for the nonce/pending-nonce handoff: `protected_command`
+    /// must advance `nonce_counter` immediately (so a second encryption can
+    /// never reuse it), while the *response* to the first command must still
+    /// be decryptable — which only works if it's decrypted with the nonce
+    /// that was actually used to encrypt it, not the already-advanced counter.
+    #[test]
+    fn test_v2_protected_command_advances_nonce_and_saves_pending() {
+        let mut sc = SecureChannelV2::new(vec![], vec![]);
+        sc.open = true;
+        sc.established = true;
+        let key = [0x11u8; AES_KEY_SIZE];
+        sc.key_h2c = Some(key);
+        sc.key_c2h = Some(key); // same key so the test can decrypt its own ciphertext
+
+        let starting_nonce = sc.nonce_counter;
+        let cmd = sc.protected_command(0x80, 0xC0, 0x00, 0x00, &[0xAA, 0xBB]).unwrap();
+
+        // Nonce advanced immediately, before any response was seen.
+        assert_ne!(sc.nonce_counter, starting_nonce);
+        assert_eq!(sc.pending_decrypt_nonce, Some(starting_nonce));
+
+        // Decrypting with the saved pending nonce recovers the inner APDU.
+        let inner = sc.decrypt_ccm(cmd.data(), &starting_nonce).unwrap();
+        assert_eq!(inner, vec![0x80, 0xC0, 0x00, 0x00, 0x02, 0xAA, 0xBB]);
+
+        // Decrypting with the *current* (already-advanced) counter must fail —
+        // this is exactly the bug the pending-nonce field prevents.
+        assert!(sc.decrypt_ccm(cmd.data(), &sc.nonce_counter).is_err());
+    }
+
+    struct MockChannel {
+        response: Result<Vec<u8>, ()>,
+    }
+
+    impl CardChannel for MockChannel {
+        fn send(&mut self, _cmd: &ApduCommand) -> Result<ApduResponse, Error> {
+            match &self.response {
+                Ok(raw) => ApduResponse::new(raw),
+                Err(()) => Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "mock I/O failure",
+                ))),
+            }
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+    }
+
+    fn open_test_session(key: [u8; AES_KEY_SIZE]) -> SecureChannelV2 {
+        let mut sc = SecureChannelV2::new(vec![], vec![]);
+        sc.open = true;
+        sc.established = true;
+        sc.key_h2c = Some(key);
+        sc.key_c2h = Some(key);
+        sc
+    }
+
+    #[test]
+    fn test_v2_transmit_send_error_closes_session_without_reuse() {
+        let mut sc = open_test_session([0x22u8; AES_KEY_SIZE]);
+        let cmd = sc.protected_command(0x80, 0xC0, 0x00, 0x00, &[0x01]).unwrap();
+
+        let mut channel = MockChannel { response: Err(()) };
+        assert!(sc.transmit(&mut channel, &cmd).is_err());
+
+        // Session must be closed, and the just-used nonce must never be
+        // handed to another encryption.
+        assert!(!sc.open);
+        assert!(sc.pending_decrypt_nonce.is_none());
+        assert!(sc.protected_command(0x80, 0xC0, 0x00, 0x00, &[0x02]).is_err());
+    }
+
+    #[test]
+    fn test_v2_transmit_decrypt_failure_closes_session() {
+        let mut sc = open_test_session([0x33u8; AES_KEY_SIZE]);
+        let cmd = sc.protected_command(0x80, 0xC0, 0x00, 0x00, &[0x01]).unwrap();
+
+        // Corrupt the ciphertext so the CCM tag check fails on decrypt.
+        let mut corrupted = cmd.data().to_vec();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0xFF;
+        let mut raw = corrupted;
+        raw.extend_from_slice(&[0x90, 0x00]);
+
+        let mut channel = MockChannel { response: Ok(raw) };
+        assert!(sc.transmit(&mut channel, &cmd).is_err());
+        assert!(!sc.open);
+        assert!(sc.protected_command(0x80, 0xC0, 0x00, 0x00, &[0x02]).is_err());
+    }
+
+    #[test]
+    fn test_v2_transmit_full_roundtrip() {
+        let mut sc = open_test_session([0x44u8; AES_KEY_SIZE]);
+        let cmd = sc.protected_command(0x80, 0xC0, 0x00, 0x00, &[0xDE, 0xAD]).unwrap();
+        let nonce_used = sc.pending_decrypt_nonce.unwrap();
+
+        // Simulate the card: it would encrypt its response with key_c2h
+        // (== key_h2c in this test) under the same nonce used for this
+        // exchange, so temporarily point nonce_counter at it to reuse
+        // encrypt_ccm rather than duplicating its logic. The plaintext
+        // itself embeds the inner status word as its last 2 bytes (matching
+        // how `ApduResponse::new` splits data from SW).
+        let saved_nonce = sc.nonce_counter;
+        sc.nonce_counter = nonce_used;
+        let card_response_data = vec![0x01, 0x02, 0x03];
+        let mut card_plaintext = card_response_data.clone();
+        card_plaintext.extend_from_slice(&[0x90, 0x00]);
+        let response_ciphertext = sc.encrypt_ccm(&card_plaintext).unwrap();
+        sc.nonce_counter = saved_nonce;
+
+        let mut raw = response_ciphertext;
+        raw.extend_from_slice(&[0x90, 0x00]);
+
+        let mut channel = MockChannel { response: Ok(raw) };
+        let resp = sc.transmit(&mut channel, &cmd).unwrap();
+        assert_eq!(resp.data(), &card_response_data[..]);
+        assert_eq!(resp.sw(), ApduResponse::SW_OK);
+        assert!(sc.open);
+        assert!(sc.pending_decrypt_nonce.is_none());
     }
 }
