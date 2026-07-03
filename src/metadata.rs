@@ -3,6 +3,22 @@
 use std::collections::BTreeSet;
 
 use crate::error::Error;
+use crate::tlv::{decode_ber_length, encode_ber_length};
+
+/// Upper bound on a single encoded wallet range's count.
+///
+/// Guards against a malformed or hostile metadata blob whose `count` field
+/// (attacker/card-controlled, up to `0xFFFFFFFF` via the 5-byte length form)
+/// would otherwise drive an unbounded loop and an OOM/CPU-exhaustion DoS.
+/// Real Keycard wallet sets are on the order of tens of entries.
+const MAX_WALLET_RANGE_COUNT: u32 = 100_000;
+
+/// Upper bound on the *total* number of wallet IDs across all ranges in one
+/// blob. `MAX_WALLET_RANGE_COUNT` alone only bounds a single range — nothing
+/// stops a hostile blob from repeating many near-max-count ranges back to
+/// back, so the aggregate needs its own bound to actually cap the total
+/// work done per `from_data` call.
+const MAX_TOTAL_WALLETS: u64 = 100_000;
 
 /// Card metadata containing a name and a set of wallet IDs.
 #[derive(Debug, Clone)]
@@ -40,6 +56,7 @@ impl Metadata {
         off += name_len;
 
         let mut wallets = BTreeSet::new();
+        let mut total_inserted: u64 = 0;
 
         while off < data.len() {
             let (start, next_off) = read_num(data, off)?;
@@ -47,8 +64,23 @@ impl Metadata {
             let (count, next_off) = read_num(data, off)?;
             off = next_off;
 
-            for i in 0..=count {
-                wallets.insert((start + i) as u64);
+            if count > MAX_WALLET_RANGE_COUNT {
+                return Err(Error::Tlv(format!(
+                    "Wallet range count too large: {} (max {})",
+                    count, MAX_WALLET_RANGE_COUNT
+                )));
+            }
+
+            total_inserted += count as u64 + 1;
+            if total_inserted > MAX_TOTAL_WALLETS {
+                return Err(Error::Tlv(format!(
+                    "Total wallet count too large: {} (max {})",
+                    total_inserted, MAX_TOTAL_WALLETS
+                )));
+            }
+
+            for i in 0..=count as u64 {
+                wallets.insert(start as u64 + i);
             }
         }
 
@@ -133,55 +165,20 @@ impl Metadata {
 
 /// Reads a variable-length encoded integer from `data` at offset `off`.
 /// Returns `(value, next_offset)`.
+///
+/// Uses the same BER length encoding as `tlv.rs` (just without an
+/// accompanying tag byte, since this isn't a full TLV value).
 fn read_num(data: &[u8], off: usize) -> Result<(u32, usize), Error> {
-    if off >= data.len() {
-        return Err(Error::Tlv("End of data while reading number".to_string()));
-    }
-
-    let first = data[off] as u32;
-    let mut off = off + 1;
-
-    if first < 0x80 {
-        // Short form
-        Ok((first, off))
-    } else {
-        let num_bytes = (first & 0x7F) as usize;
-        if off + num_bytes > data.len() {
-            return Err(Error::Tlv("End of data while reading number length".to_string()));
-        }
-
-        let mut val: u32 = 0;
-        for i in 0..num_bytes {
-            val = (val << 8) | data[off + i] as u32;
-        }
-        off += num_bytes;
-        Ok((val, off))
-    }
+    let (val, next_off) = decode_ber_length(data, off)?;
+    let val: u32 = val
+        .try_into()
+        .map_err(|_| Error::Tlv("Number too large to fit in u32".to_string()))?;
+    Ok((val, next_off))
 }
 
 /// Writes a variable-length encoded integer to `buf`.
 fn write_num(buf: &mut Vec<u8>, val: u32) {
-    if val > 0xFFFFFF {
-        buf.push(0x84);
-        buf.push(((val >> 24) & 0xFF) as u8);
-        buf.push(((val >> 16) & 0xFF) as u8);
-        buf.push(((val >> 8) & 0xFF) as u8);
-        buf.push((val & 0xFF) as u8);
-    } else if val > 0xFFFF {
-        buf.push(0x83);
-        buf.push(((val >> 16) & 0xFF) as u8);
-        buf.push(((val >> 8) & 0xFF) as u8);
-        buf.push((val & 0xFF) as u8);
-    } else if val > 0xFF {
-        buf.push(0x82);
-        buf.push(((val >> 8) & 0xFF) as u8);
-        buf.push((val & 0xFF) as u8);
-    } else if val > 0x7F {
-        buf.push(0x81);
-        buf.push((val & 0xFF) as u8);
-    } else {
-        buf.push(val as u8);
-    }
+    buf.extend_from_slice(&encode_ber_length(val as usize));
 }
 
 #[cfg(test)]
@@ -269,5 +266,102 @@ mod tests {
         let bytes = meta.to_bytes();
         let parsed = Metadata::from_data(&bytes).unwrap();
         assert_eq!(parsed.wallets(), meta.wallets());
+    }
+
+    #[test]
+    fn test_metadata_huge_range_count_rejected() {
+        // Header: version 1, empty name.
+        let mut data = vec![0x20];
+        // start = 0
+        data.push(0x00);
+        // count = 0xFFFFFFFF (5-byte long form), which would otherwise
+        // drive a ~4 billion iteration loop.
+        data.push(0x84);
+        data.extend_from_slice(&0xFFFFFFFFu32.to_be_bytes());
+
+        let err = Metadata::from_data(&data).unwrap_err();
+        match err {
+            Error::Tlv(msg) => assert!(msg.contains("too large")),
+            _ => panic!("Expected Tlv error"),
+        }
+    }
+
+    #[test]
+    fn test_metadata_range_count_at_limit_still_bounded() {
+        // A count just above the limit must still be rejected quickly
+        // rather than looping.
+        let mut data = vec![0x20, 0x00];
+        data.push(0x83);
+        let over_limit = MAX_WALLET_RANGE_COUNT + 1;
+        data.extend_from_slice(&over_limit.to_be_bytes()[1..]);
+
+        assert!(Metadata::from_data(&data).is_err());
+    }
+
+    #[test]
+    fn test_metadata_start_near_max_does_not_overflow() {
+        // start near u32::MAX plus a small count must not panic on overflow.
+        let mut data = vec![0x20];
+        data.push(0x84);
+        data.extend_from_slice(&(u32::MAX - 2).to_be_bytes());
+        data.push(0x02); // count = 2
+
+        let parsed = Metadata::from_data(&data).unwrap();
+        assert_eq!(parsed.wallets().len(), 3);
+        assert!(parsed.wallets().contains(&(u32::MAX as u64)));
+    }
+
+    #[test]
+    fn test_metadata_rejects_indefinite_length_prefix() {
+        // A length-prefix byte of exactly 0x80 (indefinite length) must be
+        // rejected, matching tlv.rs's BerTlvReader — not silently read as 0.
+        let data = vec![0x20, 0x80, 0x00];
+        assert!(Metadata::from_data(&data).is_err());
+    }
+
+    #[test]
+    fn test_metadata_rejects_length_prefix_over_4_bytes() {
+        // A long-form prefix claiming more than 4 length bytes (0x85 = 5)
+        // must be rejected outright, matching tlv.rs's BerTlvReader.
+        let mut data = vec![0x20, 0x85];
+        data.extend_from_slice(&[0x00; 5]);
+        let err = Metadata::from_data(&data).unwrap_err();
+        match err {
+            Error::Tlv(msg) => assert!(msg.contains("too long")),
+            _ => panic!("Expected Tlv error"),
+        }
+    }
+
+    #[test]
+    fn test_metadata_rejects_aggregate_count_over_multiple_ranges() {
+        // Two ranges, each individually under MAX_WALLET_RANGE_COUNT, but
+        // together over MAX_TOTAL_WALLETS. The per-range cap alone would
+        // let this through; only the aggregate cap catches it.
+        let mut data = vec![0x20]; // header, empty name
+        for _ in 0..2 {
+            data.push(0x00); // start = 0
+            data.push(0x82); // long form, 2 length bytes
+            data.extend_from_slice(&50_000u16.to_be_bytes()); // count = 50,000
+        }
+
+        let err = Metadata::from_data(&data).unwrap_err();
+        match err {
+            Error::Tlv(msg) => assert!(msg.contains("Total wallet count too large")),
+            _ => panic!("Expected Tlv error"),
+        }
+    }
+
+    #[test]
+    fn test_metadata_allows_multiple_ranges_within_aggregate_cap() {
+        // Two small ranges that stay well within the aggregate cap must
+        // still parse successfully.
+        let mut data = vec![0x20];
+        data.push(0x00); // start = 0
+        data.push(0x02); // count = 2 -> wallets 0,1,2
+        data.push(0x0A); // start = 10
+        data.push(0x01); // count = 1 -> wallets 10,11
+
+        let parsed = Metadata::from_data(&data).unwrap();
+        assert_eq!(parsed.wallets().len(), 5);
     }
 }

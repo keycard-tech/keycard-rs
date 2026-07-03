@@ -3,12 +3,9 @@
 use crate::constants::capability;
 use crate::error::Error;
 use crate::tlv::{
-    BerTlvReader, TLV_APPLICATION_INFO_TEMPLATE, TLV_CAPABILITIES, TLV_INT, TLV_KEY_UID,
-    TLV_PUB_KEY, TLV_STATUS, TLV_UID,
+    BerTlvReader, TLV_APPLICATION_INFO_TEMPLATE, TLV_CAPABILITIES, TLV_CERT, TLV_INT,
+    TLV_KEY_UID, TLV_PUB_KEY, TLV_STATUS, TLV_UID,
 };
-
-/// Tag for certificate data
-const TLV_CERT: u8 = 0x8A;
 
 /// App status flags
 const APP_STATUS_INITIALIZED: u8 = 0x10;
@@ -33,7 +30,6 @@ impl ApplicationInfo {
     ///
     /// Handles both uninitialized cards (only `TLV_PUB_KEY` present)
     /// and initialized cards (constructed `TLV_APPLICATION_INFO_TEMPLATE`).
-    #[allow(unused_assignments)]
     pub fn from_tlv(data: &[u8]) -> Result<Self, Error> {
         let mut reader = BerTlvReader::new(data);
 
@@ -70,10 +66,8 @@ impl ApplicationInfo {
 
         let mut instance_uid: Option<Vec<u8>> = None;
         let mut secure_channel_pub_key: Option<Vec<u8>> = None;
-        let mut app_version: u16 = 0;
         let mut app_status: u8 = APP_STATUS_INITIALIZED;
         let mut free_pairing_slots: u8 = 0;
-        let mut key_uid: Vec<u8> = Vec::new();
         let mut capabilities: u8 = capability::ALL;
         let mut cert_data: Option<Vec<u8>> = None;
 
@@ -92,7 +86,7 @@ impl ApplicationInfo {
         }
 
         // appVersion (INTEGER 0x02) - present in all versions
-        app_version = reader.read_integer().map_err(|e| {
+        let app_version: u16 = reader.read_integer().map_err(|e| {
             Error::Tlv(format!("Failed to read app version: {}", e))
         })? as u16;
 
@@ -101,7 +95,9 @@ impl ApplicationInfo {
             let status_bytes = reader.read_primitive(TLV_STATUS).map_err(|e| {
                 Error::Tlv(format!("Failed to read app status: {}", e))
             })?;
-            app_status = status_bytes[0];
+            app_status = *status_bytes.first().ok_or_else(|| {
+                Error::Tlv("App status TLV has empty value".to_string())
+            })?;
         }
 
         let initialized = (app_status & APP_STATUS_INITIALIZED) == APP_STATUS_INITIALIZED;
@@ -114,7 +110,7 @@ impl ApplicationInfo {
         }
 
         // keyUID (0x8E) - present in all versions
-        key_uid = reader.read_primitive(TLV_KEY_UID).map_err(|e| {
+        let key_uid: Vec<u8> = reader.read_primitive(TLV_KEY_UID).map_err(|e| {
             Error::Tlv(format!("Failed to read key UID: {}", e))
         })?;
 
@@ -123,7 +119,9 @@ impl ApplicationInfo {
             let caps_bytes = reader.read_primitive(TLV_CAPABILITIES).map_err(|e| {
                 Error::Tlv(format!("Failed to read capabilities: {}", e))
             })?;
-            capabilities = caps_bytes[0];
+            capabilities = *caps_bytes.first().ok_or_else(|| {
+                Error::Tlv("Capabilities TLV has empty value".to_string())
+            })?;
         }
 
         // certData (0x8A) - present in V4+
@@ -313,5 +311,41 @@ mod tests {
         assert!(info.secure_channel_pub_key().is_some());
         assert_eq!(info.free_pairing_slots(), 3);
         assert!(info.pin_retries().is_none()); // V3 doesn't have pin retries
+    }
+
+    #[test]
+    fn test_empty_app_status_value_errors_instead_of_panicking() {
+        let mut writer = BerTlvWriter::new();
+        writer.write_constructed(TLV_APPLICATION_INFO_TEMPLATE, |w| {
+            w.write_integer(TLV_INT, 0x0402);
+            w.write_primitive(TLV_STATUS, &[]); // malformed: zero-length value
+            w.write_primitive(TLV_KEY_UID, &[0x01]);
+            w.write_primitive(TLV_CAPABILITIES, &[capability::ALL]);
+        });
+        let data = writer.to_vec();
+
+        let err = ApplicationInfo::from_tlv(&data).unwrap_err();
+        match err {
+            Error::Tlv(msg) => assert!(msg.contains("App status")),
+            _ => panic!("Expected Tlv error"),
+        }
+    }
+
+    #[test]
+    fn test_empty_capabilities_value_errors_instead_of_panicking() {
+        let mut writer = BerTlvWriter::new();
+        writer.write_constructed(TLV_APPLICATION_INFO_TEMPLATE, |w| {
+            w.write_integer(TLV_INT, 0x0402);
+            w.write_primitive(TLV_STATUS, &[APP_STATUS_INITIALIZED]);
+            w.write_primitive(TLV_KEY_UID, &[0x01]);
+            w.write_primitive(TLV_CAPABILITIES, &[]); // malformed: zero-length value
+        });
+        let data = writer.to_vec();
+
+        let err = ApplicationInfo::from_tlv(&data).unwrap_err();
+        match err {
+            Error::Tlv(msg) => assert!(msg.contains("apabilities")),
+            _ => panic!("Expected Tlv error"),
+        }
     }
 }

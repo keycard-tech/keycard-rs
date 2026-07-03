@@ -1,5 +1,8 @@
 //! BIP32 derivation path parsing and encoding.
 
+use std::fmt;
+use std::str::FromStr;
+
 use crate::constants::derive_p1;
 use crate::error::Error;
 
@@ -12,7 +15,9 @@ pub struct KeyPath {
     data: Vec<u8>,
 }
 
-impl KeyPath {
+impl FromStr for KeyPath {
+    type Err = Error;
+
     /// Parses a BIP32 path string.
     ///
     /// # Format
@@ -22,12 +27,13 @@ impl KeyPath {
     ///
     /// # Examples
     /// ```
+    /// use std::str::FromStr;
     /// use keycard_rs::parsing::key_path::KeyPath;
     ///
     /// let path = KeyPath::from_str("m/44'/0'/0'/0/0").unwrap();
     /// assert_eq!(path.source(), 0x00); // SOURCE_MASTER
     /// ```
-    pub fn from_str(path: &str) -> Result<Self, Error> {
+    fn from_str(path: &str) -> Result<Self, Error> {
         let mut components: Vec<&str> = path.split('/').collect();
 
         let first = components.remove(0).trim();
@@ -62,7 +68,9 @@ impl KeyPath {
 
         Ok(Self { source, data })
     }
+}
 
+impl KeyPath {
     /// Direct construction from raw bytes with a source.
     pub fn from_raw(data: Vec<u8>, source: u8) -> Self {
         Self { source, data }
@@ -84,15 +92,16 @@ impl KeyPath {
         &self.data
     }
 
-    /// Reverse-encodes to a BIP32 path string.
-    pub fn to_string(&self) -> String {
-        let mut s = String::new();
+}
 
+impl fmt::Display for KeyPath {
+    /// Reverse-encodes to a BIP32 path string.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.source {
-            derive_p1::SOURCE_MASTER => s.push('m'),
-            derive_p1::SOURCE_PARENT => s.push_str(".."),
-            derive_p1::SOURCE_CURRENT => s.push('.'),
-            _ => s.push('.'),
+            derive_p1::SOURCE_MASTER => f.write_str("m")?,
+            derive_p1::SOURCE_PARENT => f.write_str("..")?,
+            derive_p1::SOURCE_CURRENT => f.write_str(".")?,
+            _ => f.write_str(".")?,
         }
 
         for chunk in self.data.chunks_exact(4) {
@@ -100,14 +109,13 @@ impl KeyPath {
                 | ((chunk[1] as u32) << 16)
                 | ((chunk[2] as u32) << 8)
                 | (chunk[3] as u32);
-            s.push('/');
-            s.push_str(&num.to_string());
+            write!(f, "/{}", num)?;
             if chunk[0] & 0x80 != 0 {
-                s.push('\'');
+                f.write_str("'")?;
             }
         }
 
-        s
+        Ok(())
     }
 }
 

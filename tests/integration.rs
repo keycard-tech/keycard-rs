@@ -79,6 +79,13 @@ fn select_applet() {
         "expected non-zero app version, got {}",
         info.app_version()
     );
+    eprintln!(
+        "app_version={} secure_channel_version={:?} has_master_key={} initialized={}",
+        info.app_version_string(),
+        keycard.secure_channel_version(),
+        info.has_master_key(),
+        info.is_initialized(),
+    );
 }
 
 /// Full integration test: connect → select → pair (V1 only) → open secure channel
@@ -86,11 +93,17 @@ fn select_applet() {
 ///
 /// Uses the Ethereum main wallet path `m/44'/60'/0'/0/0`.
 ///
-/// Requires a card that is initialized with the default PIN ("123456") and
-/// default pairing password ("KeycardDefaultPairing").
+/// Requires the `KEYCARD_TEST_PIN` environment variable to be set to this
+/// card's actual PIN (deliberately not hardcoded: a wrong guess here
+/// decrements the card's real PIN retry counter). Also requires the default
+/// pairing password ("KeycardDefaultPairing") if the card uses Secure
+/// Channel V1.
 #[test]
 #[ignore]
 fn full_sign_flow() {
+    let pin = std::env::var("KEYCARD_TEST_PIN")
+        .expect("set KEYCARD_TEST_PIN to this card's actual PIN before running full_sign_flow");
+
     // 1. Connect and select
     let channel = PcscChannel::connect().expect("failed to connect to card via PC/SC");
     let channel = LoggingChannel::new(channel);
@@ -118,7 +131,7 @@ fn full_sign_flow() {
 
     // 4. Verify PIN
     let pin_resp = keycard
-        .verify_pin("000000")
+        .verify_pin(&pin)
         .expect("verify_pin failed");
     assert!(
         pin_resp.is_ok(),

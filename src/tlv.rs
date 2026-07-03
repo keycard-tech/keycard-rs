@@ -36,6 +36,66 @@ pub const TLV_UID: u8 = 0x8F;
 pub const TLV_STATUS: u8 = 0x8C;
 
 // ============================================================================
+// BER length encoding
+// ============================================================================
+//
+// Shared by `BerTlvReader`/`BerTlvWriter` below and by `crate::metadata`,
+// which encodes its own variable-length integers the same way (just without
+// an accompanying tag byte, so it isn't a full TLV value).
+
+/// Encodes a length in BER-TLV encoding: short form (1 byte, 0..=127) or
+/// long form (a 0x81-0x84 prefix followed by 1-4 big-endian length bytes).
+pub(crate) fn encode_ber_length(len: usize) -> Vec<u8> {
+    if len < 0x80 {
+        vec![len as u8]
+    } else if len < 0x100 {
+        vec![0x81, len as u8]
+    } else if len < 0x10000 {
+        vec![0x82, (len >> 8) as u8, len as u8]
+    } else if len < 0x1000000 {
+        vec![0x83, (len >> 16) as u8, (len >> 8) as u8, len as u8]
+    } else {
+        vec![0x84, (len >> 24) as u8, (len >> 16) as u8, (len >> 8) as u8, len as u8]
+    }
+}
+
+/// Decodes a BER-TLV length field from `data` at offset `off`.
+/// Returns `(value, next_offset)`. Rejects indefinite length (`0x80`) and
+/// any long form claiming more than 4 length bytes.
+pub(crate) fn decode_ber_length(data: &[u8], off: usize) -> Result<(usize, usize), Error> {
+    if off >= data.len() {
+        return Err(Error::Tlv("End of buffer, no length to read".to_string()));
+    }
+
+    let first = data[off] as usize;
+    let mut off = off + 1;
+
+    if first < 0x80 {
+        // Short form: length is the byte value directly
+        Ok((first, off))
+    } else if first == 0x80 {
+        // Indefinite length - not supported
+        Err(Error::Tlv("Indefinite length encoding not supported".to_string()))
+    } else {
+        // Long form: low 7 bits are the number of length bytes that follow
+        let num_bytes = first & 0x7F;
+        if num_bytes > 4 {
+            return Err(Error::Tlv(format!("Length encoding too long: {} bytes", num_bytes)));
+        }
+        if off + num_bytes > data.len() {
+            return Err(Error::Tlv("End of buffer while reading length".to_string()));
+        }
+
+        let mut len: usize = 0;
+        for i in 0..num_bytes {
+            len = (len << 8) | data[off + i] as usize;
+        }
+        off += num_bytes;
+        Ok((len, off))
+    }
+}
+
+// ============================================================================
 // BerTlvReader
 // ============================================================================
 
@@ -73,36 +133,9 @@ impl<'a> BerTlvReader<'a> {
     /// Reads the TLV length field.
     /// Supports short form (1 byte, 0..=127) and long form (1..=4 bytes).
     pub fn read_length(&mut self) -> Result<usize, Error> {
-        if self.pos >= self.buffer.len() {
-            return Err(Error::Tlv("End of buffer, no length to read".to_string()));
-        }
-
-        let first = self.buffer[self.pos] as usize;
-        self.pos += 1;
-
-        if first < 0x80 {
-            // Short form: length is the byte value directly
-            Ok(first)
-        } else if first == 0x80 {
-            // Indefinite length - not supported
-            Err(Error::Tlv("Indefinite length encoding not supported".to_string()))
-        } else {
-            // Long form: high nibble is number of length bytes
-            let num_bytes = first & 0x7F;
-            if num_bytes > 4 {
-                return Err(Error::Tlv(format!("Length encoding too long: {} bytes", num_bytes)));
-            }
-            if self.pos + num_bytes > self.buffer.len() {
-                return Err(Error::Tlv("End of buffer while reading length".to_string()));
-            }
-
-            let mut len: usize = 0;
-            for i in 0..num_bytes {
-                len = (len << 8) | self.buffer[self.pos + i] as usize;
-            }
-            self.pos += num_bytes;
-            Ok(len)
-        }
+        let (len, next_pos) = decode_ber_length(self.buffer, self.pos)?;
+        self.pos = next_pos;
+        Ok(len)
     }
 
     /// Asserts next tag matches, reads and returns the length.
@@ -220,28 +253,7 @@ impl BerTlvWriter {
 
     /// Writes a length field in BER-TLV encoding (short or long form).
     pub fn write_num_length(&mut self, len: usize) {
-        if len < 0x80 {
-            // Short form
-            self.buffer.push(len as u8);
-        } else if len < 0x100 {
-            self.buffer.push(0x81);
-            self.buffer.push(len as u8);
-        } else if len < 0x10000 {
-            self.buffer.push(0x82);
-            self.buffer.push((len >> 8) as u8);
-            self.buffer.push(len as u8);
-        } else if len < 0x1000000 {
-            self.buffer.push(0x83);
-            self.buffer.push((len >> 16) as u8);
-            self.buffer.push((len >> 8) as u8);
-            self.buffer.push(len as u8);
-        } else {
-            self.buffer.push(0x84);
-            self.buffer.push((len >> 24) as u8);
-            self.buffer.push((len >> 16) as u8);
-            self.buffer.push((len >> 8) as u8);
-            self.buffer.push(len as u8);
-        }
+        self.buffer.extend_from_slice(&encode_ber_length(len));
     }
 
     /// Writes a single tag byte.

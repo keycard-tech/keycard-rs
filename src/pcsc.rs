@@ -22,11 +22,11 @@ impl PcscChannel {
     ///   auto-selects the first available reader.
     pub fn new(reader_name: Option<&str>) -> Result<Self, Error> {
         let context = pcsc::Context::establish(pcsc::Scope::User)
-            .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+            .map_err(Error::io_other)?;
 
         let readers = context
             .list_readers_owned()
-            .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+            .map_err(Error::io_other)?;
 
         if readers.is_empty() {
             return Err(Error::Io(std::io::Error::new(
@@ -56,7 +56,7 @@ impl PcscChannel {
                 pcsc::ShareMode::Shared,
                 pcsc::Protocols::T0 | pcsc::Protocols::T1,
             )
-            .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+            .map_err(Error::io_other)?;
 
         Ok(Self { card: Some(card) })
     }
@@ -89,7 +89,7 @@ impl CardChannel for PcscChannel {
 
         let response = card
             .transmit(&data, &mut response_buf)
-            .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+            .map_err(Error::io_other)?;
 
         ApduResponse::new(response)
     }

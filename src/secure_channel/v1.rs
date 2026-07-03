@@ -9,9 +9,11 @@ use k256::{AffinePoint, ecdh::EphemeralSecret};
 use k256::elliptic_curve::sec1::ToSec1Point;
 use sha2::{Digest, Sha512, Sha256};
 
+use zeroize::Zeroize;
+
 use crate::apdu::{ApduCommand, ApduResponse};
 use crate::channel::CardChannel;
-use crate::constants::ins;
+use crate::constants::{ins, PAIRING_MAX_CLIENT_COUNT};
 use crate::error::Error;
 use crate::secure_channel::{SecureChannel, SecureChannelVersion, Pairing};
 
@@ -22,8 +24,6 @@ type Aes256CbcDec = Decryptor<Aes256>;
 const SC_BLOCK_SIZE: usize = 16;
 /// ECDH shared secret length in bytes.
 const SC_SECRET_LENGTH: usize = 32;
-/// Maximum number of pairing slots on the card.
-const PAIRING_MAX_CLIENT_COUNT: usize = 5;
 
 /// Secure Channel V1 session.
 pub struct SecureChannelV1 {
@@ -41,6 +41,13 @@ pub struct SecureChannelV1 {
     mac_key: Option<[u8; 32]>,
     /// Whether the secure channel session is active.
     open: bool,
+    /// Whether the channel has ever been successfully opened.
+    ///
+    /// Distinct from `open`: this stays `true` across a transmit failure so
+    /// that `protected_command` knows to refuse (rather than silently send
+    /// plaintext) once the session has previously carried protected traffic.
+    /// Only `reset()` clears it, since that's the only deliberate teardown.
+    established: bool,
 }
 
 impl SecureChannelV1 {
@@ -53,6 +60,7 @@ impl SecureChannelV1 {
             enc_key: None,
             mac_key: None,
             open: false,
+            established: false,
         }
     }
 
@@ -100,7 +108,7 @@ impl SecureChannelV1 {
 
         // Generate random IV
         let mut iv = [0u8; SC_BLOCK_SIZE];
-        getrandom::getrandom(&mut iv).map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+        getrandom::getrandom(&mut iv).map_err(Error::io_other)?;
 
         // Encrypt with AES-CBC using ISO 7816-4 padding
         let enc = Aes256CbcEnc::new_from_slices(secret, &iv)
@@ -145,6 +153,7 @@ impl SecureChannel for SecureChannelV1 {
         response.check_ok()?;
         self.verify_mutual_auth_response(&response)?;
 
+        self.established = true;
         Ok(())
     }
 
@@ -157,7 +166,7 @@ impl SecureChannel for SecureChannelV1 {
         // Generate random client challenge
         let mut client_challenge = [0u8; 32];
         getrandom::getrandom(&mut client_challenge)
-            .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+            .map_err(Error::io_other)?;
 
         // Step 1: Send client challenge
         let resp = self.pair(channel, 0x00, mode, &client_challenge)?;
@@ -174,7 +183,7 @@ impl SecureChannel for SecureChannelV1 {
         // Verify card cryptogram: SHA-256(shared_secret || client_challenge)
         let mut hasher = Sha256::new();
         hasher.update(shared_secret);
-        hasher.update(&client_challenge);
+        hasher.update(client_challenge);
         let expected = hasher.finalize();
 
         if card_cryptogram != expected.as_slice() {
@@ -224,7 +233,7 @@ impl SecureChannel for SecureChannelV1 {
 
         for i in 0..PAIRING_MAX_CLIENT_COUNT {
             if (i as u8) != current_index {
-                let cmd = self.protected_command(0x80, ins::UNPAIR, i as u8, 0, &[]);
+                let cmd = self.protected_command(0x80, ins::UNPAIR, i as u8, 0, &[])?;
                 self.transmit(channel, &cmd)?.check_ok()?;
             }
         }
@@ -248,7 +257,7 @@ impl SecureChannel for SecureChannelV1 {
     ) -> Result<ApduResponse, Error> {
         let mut data = [0u8; SC_SECRET_LENGTH];
         getrandom::getrandom(&mut data)
-            .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+            .map_err(Error::io_other)?;
         self.mutually_authenticate_with_data(channel, &data)
     }
 
@@ -257,7 +266,7 @@ impl SecureChannel for SecureChannelV1 {
         channel: &mut dyn CardChannel,
         data: &[u8],
     ) -> Result<ApduResponse, Error> {
-        let cmd = self.protected_command(0x80, ins::MUTUALLY_AUTHENTICATE, 0, 0, data);
+        let cmd = self.protected_command(0x80, ins::MUTUALLY_AUTHENTICATE, 0, 0, data)?;
         self.transmit(channel, &cmd)
     }
 
@@ -277,7 +286,7 @@ impl SecureChannel for SecureChannelV1 {
         channel: &mut dyn CardChannel,
         p1: u8,
     ) -> Result<ApduResponse, Error> {
-        let cmd = self.protected_command(0x80, ins::UNPAIR, p1, 0, &[]);
+        let cmd = self.protected_command(0x80, ins::UNPAIR, p1, 0, &[])?;
         self.transmit(channel, &cmd)
     }
 
@@ -288,9 +297,14 @@ impl SecureChannel for SecureChannelV1 {
         p1: u8,
         p2: u8,
         data: &[u8],
-    ) -> ApduCommand {
+    ) -> Result<ApduCommand, Error> {
         if !self.open {
-            return ApduCommand::new(cla, ins, p1, p2, data.to_vec());
+            if self.established {
+                return Err(Error::Protocol(
+                    "Secure channel was closed after an error; call auto_open again before sending protected commands".to_string(),
+                ));
+            }
+            return Ok(ApduCommand::new(cla, ins, p1, p2, data.to_vec()));
         }
 
         let enc_key = self.enc_key.as_ref()
@@ -302,8 +316,15 @@ impl SecureChannel for SecureChannelV1 {
         let mut buf = vec![0u8; data.len() + SC_BLOCK_SIZE];
         buf[..data.len()].copy_from_slice(data);
         let encrypted = enc.encrypt_padded::<aes::cipher::block_padding::Iso7816>(&mut buf, data.len())
-            .expect("AES-CBC encryption failed");
+            .map_err(|_| Error::Crypto("AES-CBC encryption failed".to_string()))?;
         let encrypted = encrypted.to_vec();
+
+        if encrypted.len() + SC_BLOCK_SIZE > u8::MAX as usize {
+            return Err(Error::InvalidArgument(format!(
+                "Protected command payload too large: encrypted length {} bytes (IV + ciphertext) exceeds the 1-byte length field",
+                encrypted.len() + SC_BLOCK_SIZE
+            )));
+        }
 
         // Build metadata for MAC
         let mut meta = [0u8; SC_BLOCK_SIZE];
@@ -321,7 +342,7 @@ impl SecureChannel for SecureChannelV1 {
         final_data.extend_from_slice(&self.iv);
         final_data.extend_from_slice(&encrypted);
 
-        ApduCommand::new(cla, ins, p1, p2, final_data)
+        Ok(ApduCommand::new(cla, ins, p1, p2, final_data))
     }
 
     fn transmit(
@@ -329,7 +350,17 @@ impl SecureChannel for SecureChannelV1 {
         channel: &mut dyn CardChannel,
         cmd: &ApduCommand,
     ) -> Result<ApduResponse, Error> {
-        let resp = channel.send(cmd)?;
+        let resp = match channel.send(cmd) {
+            Ok(resp) => resp,
+            Err(e) => {
+                // We can't know whether the card actually received or
+                // processed the command, so the session's IV/MAC state may
+                // now be desynced from the card's — close it rather than
+                // leave `open` true for a channel that may keep failing.
+                self.open = false;
+                return Err(e);
+            }
+        };
 
         // If security condition not satisfied, invalidate session
         if resp.sw() == ApduResponse::SW_SECURITY_CONDITION_NOT_SATISFIED {
@@ -339,6 +370,7 @@ impl SecureChannel for SecureChannelV1 {
         if self.open {
             let data = resp.data();
             if data.len() < SC_BLOCK_SIZE {
+                self.open = false;
                 return Err(Error::Protocol("Encrypted response too short".to_string()));
             }
 
@@ -354,15 +386,23 @@ impl SecureChannel for SecureChannelV1 {
             let dec = Aes256CbcDec::new_from_slices(enc_key, &self.iv)
                 .expect("Invalid AES key/IV");
             let mut encrypted_buf = encrypted.to_vec();
-            let plain_data = dec.decrypt_padded::<aes::cipher::block_padding::Iso7816>(&mut encrypted_buf)
-                .map_err(|_| Error::Protocol("AES-CBC decryption failed".to_string()))?;
-            let plain_data = plain_data.to_vec();
+            let plain_data = match dec.decrypt_padded::<aes::cipher::block_padding::Iso7816>(&mut encrypted_buf) {
+                Ok(plain_data) => plain_data.to_vec(),
+                Err(_) => {
+                    self.open = false;
+                    return Err(Error::Protocol("AES-CBC decryption failed".to_string()));
+                }
+            };
 
             // Update IV with MAC
             self.update_iv(&meta, encrypted);
 
             // Verify MAC
-            if &self.iv != mac {
+            if self.iv != mac {
+                // Local and card IV state are now desynced; the session can
+                // no longer produce valid MACs, so tear it down rather than
+                // leaving `open` true for a channel that will keep failing.
+                self.open = false;
                 return Err(Error::Protocol("Invalid MAC".to_string()));
             }
 
@@ -383,6 +423,14 @@ impl SecureChannel for SecureChannelV1 {
 
     fn reset(&mut self) {
         self.open = false;
+        self.established = false;
+        // Zeroize before dropping the old value: a plain `= None` assignment
+        // overwrites the key bytes too, but the compiler is free to treat
+        // that as a dead store and elide it since the old value is never
+        // read again — `zeroize()` uses a volatile write that can't be
+        // optimized away.
+        self.enc_key.zeroize();
+        self.mac_key.zeroize();
         self.enc_key = None;
         self.mac_key = None;
         self.iv = [0u8; SC_BLOCK_SIZE];
@@ -421,13 +469,16 @@ impl SecureChannelV1 {
         hasher.update(secret);
         hasher.update(pairing.pairing_key());
         hasher.update(&data[0..SC_SECRET_LENGTH]);
-        let key_data = hasher.finalize();
+        let mut key_data = hasher.finalize();
 
         // enc_key = key_data[0..32], mac_key = key_data[32..64]
         let mut enc_key = [0u8; 32];
         let mut mac_key = [0u8; 32];
         enc_key.copy_from_slice(&key_data[0..32]);
         mac_key.copy_from_slice(&key_data[32..64]);
+        // key_data holds both keys concatenated; scrub it now that they've
+        // been split into their own (zeroize-on-drop) fields.
+        key_data.as_mut_slice().zeroize();
 
         // IV = data[32..] (the salt/seed-IV from the card)
         let iv_data = &data[SC_SECRET_LENGTH..];
@@ -481,6 +532,13 @@ impl SecureChannelV1 {
     }
 }
 
+impl Drop for SecureChannelV1 {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+        self.enc_key.zeroize();
+        self.mac_key.zeroize();
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -496,10 +554,18 @@ mod tests {
     #[test]
     fn test_v1_protected_command_not_open() {
         let mut sc = SecureChannelV1::new();
-        let cmd = sc.protected_command(0x80, 0xF2, 0x00, 0x00, &[0x01, 0x02]);
+        let cmd = sc.protected_command(0x80, 0xF2, 0x00, 0x00, &[0x01, 0x02]).unwrap();
         assert_eq!(cmd.cla(), 0x80);
         assert_eq!(cmd.ins(), 0xF2);
         assert_eq!(cmd.data(), &[0x01, 0x02]);
+    }
+
+    #[test]
+    fn test_v1_protected_command_errors_after_established_and_closed() {
+        let mut sc = SecureChannelV1::new();
+        sc.established = true;
+        sc.open = false;
+        assert!(sc.protected_command(0x80, 0xF2, 0x00, 0x00, &[]).is_err());
     }
 
     #[test]
@@ -507,5 +573,77 @@ mod tests {
         let _sc = SecureChannelV1::new();
         // Without pairing, unpair_others should error
         // We can't test the full flow without a mock channel
+    }
+
+    struct MockChannel {
+        response: Result<Vec<u8>, ()>,
+    }
+
+    impl CardChannel for MockChannel {
+        fn send(&mut self, _cmd: &ApduCommand) -> Result<ApduResponse, Error> {
+            match &self.response {
+                Ok(raw) => ApduResponse::new(raw),
+                Err(()) => Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "mock I/O failure",
+                ))),
+            }
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+    }
+
+    fn open_test_session() -> SecureChannelV1 {
+        let mut sc = SecureChannelV1::new();
+        sc.open = true;
+        sc.established = true;
+        sc.enc_key = Some([0x11u8; 32]);
+        sc.mac_key = Some([0x22u8; 32]);
+        sc.iv = [0u8; SC_BLOCK_SIZE];
+        sc
+    }
+
+    #[test]
+    fn test_v1_transmit_send_error_closes_session_without_reuse() {
+        let mut sc = open_test_session();
+        let cmd = ApduCommand::new(0x80, 0xC0, 0x00, 0x00, vec![]);
+
+        let mut channel = MockChannel { response: Err(()) };
+        assert!(sc.transmit(&mut channel, &cmd).is_err());
+
+        // A raw I/O failure must close the session, not merely leave it
+        // "open" with a possibly-desynced IV.
+        assert!(!sc.open);
+        assert!(sc.protected_command(0x80, 0xC0, 0x00, 0x00, &[]).is_err());
+    }
+
+    #[test]
+    fn test_v1_transmit_short_response_closes_session() {
+        let mut sc = open_test_session();
+        let cmd = ApduCommand::new(0x80, 0xC0, 0x00, 0x00, vec![]);
+
+        // No data at all beyond the status word — shorter than one MAC block.
+        let mut channel = MockChannel { response: Ok(vec![0x90, 0x00]) };
+        assert!(sc.transmit(&mut channel, &cmd).is_err());
+        assert!(!sc.open);
+    }
+
+    #[test]
+    fn test_v1_transmit_decrypt_failure_closes_session() {
+        let mut sc = open_test_session();
+        let cmd = ApduCommand::new(0x80, 0xC0, 0x00, 0x00, vec![]);
+
+        // mac(16 bytes) || encrypted(15 bytes) — the ciphertext portion is
+        // deliberately not a multiple of the AES block size, which
+        // `decrypt_padded` rejects deterministically (per the `cipher`
+        // crate's own docs) without needing to guess at padding contents.
+        let mut raw = vec![0u8; SC_BLOCK_SIZE];
+        raw.extend_from_slice(&[0xAB; 15]);
+        raw.extend_from_slice(&[0x90, 0x00]);
+
+        let mut channel = MockChannel { response: Ok(raw) };
+        assert!(sc.transmit(&mut channel, &cmd).is_err());
+        assert!(!sc.open);
     }
 }

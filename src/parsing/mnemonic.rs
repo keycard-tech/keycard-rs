@@ -2,6 +2,7 @@
 
 use pbkdf2::pbkdf2_hmac;
 use sha2::Sha512;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::constants::MNEMONIC_PBKDF2_ITERATIONS;
 use crate::error::Error;
@@ -2066,6 +2067,15 @@ pub struct Mnemonic {
     wordlist: Option<&'static [&'static str]>,
 }
 
+impl Drop for Mnemonic {
+    /// Scrubs the word indexes from memory: combined with the (public)
+    /// wordlist, they reconstruct the mnemonic phrase, which is equivalent
+    /// in sensitivity to the seed/private key it derives.
+    fn drop(&mut self) {
+        self.indexes.zeroize();
+    }
+}
+
 impl Mnemonic {
     const WORDLIST_SIZE: usize = 2048;
 
@@ -2136,7 +2146,9 @@ impl Mnemonic {
     ///
     /// Uses `PBKDF2-HMAC-SHA512(phrase, "mnemonic" + password, 2048, 64)`.
     pub fn to_binary_seed_with_password(&self, password: &str) -> Result<Vec<u8>, Error> {
-        let phrase = self.to_phrase()?;
+        // The phrase is only needed transiently to derive the seed; scrub it
+        // as soon as we're done rather than leaving it for the allocator.
+        let phrase = Zeroizing::new(self.to_phrase()?);
         Ok(Self::binary_seed_from_phrase(&phrase, password))
     }
 
@@ -2147,7 +2159,7 @@ impl Mnemonic {
 
     /// Returns the full BIP32 master keypair derived from this mnemonic with a password.
     pub fn to_bip32_keypair_with_password(&self, password: &str) -> Result<Bip32KeyPair, Error> {
-        let seed = self.to_binary_seed_with_password(password)?;
+        let seed = Zeroizing::new(self.to_binary_seed_with_password(password)?);
         Ok(Bip32KeyPair::from_binary_seed(&seed))
     }
 
@@ -2155,7 +2167,8 @@ impl Mnemonic {
     ///
     /// Uses `PBKDF2-HMAC-SHA512(phrase, "mnemonic" + password, 2048, 64)`.
     pub fn binary_seed_from_phrase(phrase: &str, password: &str) -> Vec<u8> {
-        let salt = format!("mnemonic{}", password);
+        // The salt embeds the password; `Zeroizing` scrubs our copy on drop.
+        let salt = Zeroizing::new(format!("mnemonic{}", password));
         let mut output = vec![0u8; 64];
         pbkdf2_hmac::<Sha512>(phrase.as_bytes(), salt.as_bytes(), MNEMONIC_PBKDF2_ITERATIONS, &mut output);
         output
