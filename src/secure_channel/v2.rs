@@ -448,6 +448,13 @@ impl SecureChannelV2 {
         let sig = Signature::from_der(signature_bytes)
             .map_err(|_| Error::Crypto("Failed to parse card signature DER".to_string()))?;
 
+        // The applet's OPEN_SECURE_CHANNEL signing path doesn't normalize `s` to low-S form
+        // (unlike its application-signing path, which does), so roughly half of otherwise-valid
+        // handshake signatures have high S — and this crate's ECDSA verifier rejects those by
+        // default. Malleability doesn't matter for a one-shot transcript-authentication
+        // signature, so normalizing before verifying is safe.
+        let sig = sig.normalize_s();
+
         // Verify using the card's identity public key
         let verifying_key = parse_verifying_key(card_ident_pub)?;
 
