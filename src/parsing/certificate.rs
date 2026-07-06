@@ -126,7 +126,8 @@ impl Certificate {
             Signature::from_der(signature_bytes).map_err(|_| {
                 Error::Crypto("Failed to parse DER signature".to_string())
             })?
-        };
+        }
+        .normalize_s();
 
         // Verify using the card's identity public key
         let verifying_key = parse_verifying_key(cert.ident_pub())?;

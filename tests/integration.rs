@@ -208,3 +208,157 @@ fn full_sign_flow() {
             .expect("unpairing failed");
     }
 }
+
+/// Integration test: connect → select → factory reset → re-select → init.
+///
+/// Tests the full factory reset and initialization flow for both Secure
+/// Channel V1 and V2. For V1, the card is initialized with a pairing
+/// password. For V2, the card is initialized without a pairing password
+/// (since V2 does not use pairing).
+///
+/// **WARNING**: This test will factory reset the card, erasing all data
+/// including keys, PINs, and pairings. Do not run on a card with
+/// important data.
+#[test]
+#[ignore]
+fn factory_reset_and_init() {
+    // Test credentials
+    const TEST_PIN: &str = "123456";
+    const TEST_PUK: &str = "098765098765";
+    const TEST_PAIRING_PASSWORD: &str = "TestPairingPassword";
+
+    // 1. Connect and select
+    let channel = PcscChannel::connect().expect("failed to connect to card via PC/SC");
+    let channel = LoggingChannel::new(channel);
+    let mut keycard = KeycardCommandSet::new_with_ca(channel, TEST_CA_PUBLIC_KEY);
+
+    let resp = keycard.select().expect("SELECT failed");
+    assert!(resp.is_ok(), "SELECT failed: {:02X} {:02X}", resp.sw1(), resp.sw2());
+
+    let info = keycard.app_info().expect("app_info should be set");
+    let has_secure_channel = info.has_secure_channel();
+    let secure_channel_version = keycard.secure_channel_version();
+    eprintln!(
+        "Before reset: app_version={} secure_channel={:?} initialized={}",
+        info.app_version_string(),
+        secure_channel_version,
+        info.is_initialized(),
+    );
+
+    // 2. Factory reset
+    let reset_resp = keycard.factory_reset().expect("FACTORY_RESET failed");
+    assert!(
+        reset_resp.is_ok(),
+        "FACTORY_RESET failed: {:02X} {:02X}",
+        reset_resp.sw1(),
+        reset_resp.sw2()
+    );
+    eprintln!("factory reset complete");
+
+    // 3. Re-select to get fresh app info after reset
+    let resp = keycard.select().expect("SELECT after reset failed");
+    assert!(resp.is_ok(), "SELECT after reset failed: {:02X} {:02X}", resp.sw1(), resp.sw2());
+
+    let info = keycard.app_info().expect("app_info should be set after re-select");
+    assert!(
+        !info.is_initialized(),
+        "card should not be initialized after factory reset"
+    );
+    eprintln!(
+        "After reset: app_version={} secure_channel={:?} initialized={}",
+        info.app_version_string(),
+        keycard.secure_channel_version(),
+        info.is_initialized(),
+    );
+
+    // 4. Initialize the card (V1 or V2 path)
+    let sc_version = keycard.secure_channel_version();
+    match sc_version {
+        Some(SecureChannelVersion::V1) => {
+            eprintln!("initializing with Secure Channel V1 (with pairing password)");
+            let init_resp = keycard
+                .init(TEST_PIN, TEST_PUK, TEST_PAIRING_PASSWORD)
+                .expect("INIT failed");
+            assert!(
+                init_resp.is_ok(),
+                "INIT failed: {:02X} {:02X}",
+                init_resp.sw1(),
+                init_resp.sw2()
+            );
+        }
+        Some(SecureChannelVersion::V2) | None => {
+            eprintln!("initializing with Secure Channel V2 (no pairing password)");
+            let init_resp = keycard
+                .init_v2(TEST_PIN, TEST_PUK)
+                .expect("INIT without pairing failed");
+            assert!(
+                init_resp.is_ok(),
+                "INIT without pairing failed: {:02X} {:02X}",
+                init_resp.sw1(),
+                init_resp.sw2()
+            );
+        }
+    }
+
+    eprintln!("card initialized successfully");
+
+    // 5. Re-select to verify the card is now initialized
+    let resp = keycard.select().expect("SELECT after init failed");
+    assert!(resp.is_ok(), "SELECT after init failed: {:02X} {:02X}", resp.sw1(), resp.sw2());
+
+    let info = keycard.app_info().expect("app_info should be set after init");
+    assert!(
+        info.is_initialized(),
+        "card should be initialized after INIT"
+    );
+    eprintln!(
+        "After init: app_version={} secure_channel={:?} initialized={}",
+        info.app_version_string(),
+        keycard.secure_channel_version(),
+        info.is_initialized(),
+    );
+
+    // 6. Verify we can open a secure channel and verify the PIN
+    if has_secure_channel {
+        match sc_version {
+            Some(SecureChannelVersion::V1) => {
+                // Pair with the test password
+                keycard
+                    .auto_pair(TEST_PAIRING_PASSWORD)
+                    .expect("pairing failed");
+                keycard
+                    .auto_open_secure_channel()
+                    .expect("failed to open secure channel");
+
+                // Verify PIN
+                let pin_resp = keycard.verify_pin(TEST_PIN).expect("verify_pin failed");
+                assert!(
+                    pin_resp.is_ok(),
+                    "PIN verification failed: {:02X} {:02X}",
+                    pin_resp.sw1(),
+                    pin_resp.sw2()
+                );
+
+                // Unpair
+                keycard.auto_unpair().expect("unpairing failed");
+            }
+            Some(SecureChannelVersion::V2) => {
+                // Open secure channel (no pairing needed for V2)
+                keycard
+                    .auto_open_secure_channel()
+                    .expect("failed to open secure channel");
+
+                // Verify PIN
+                let pin_resp = keycard.verify_pin(TEST_PIN).expect("verify_pin failed");
+                assert!(
+                    pin_resp.is_ok(),
+                    "PIN verification failed: {:02X} {:02X}",
+                    pin_resp.sw1(),
+                    pin_resp.sw2()
+                );
+            }
+            None => {}
+        }
+        eprintln!("secure channel verification passed");
+    }
+}

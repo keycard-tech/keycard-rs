@@ -773,6 +773,38 @@ impl KeycardCommandSet {
         }
     }
 
+    /// Initializes the card without a pairing password (V2 only).
+    ///
+    /// Secure Channel V2 does not use a shared secret for pairing, so this
+    /// convenience method initializes the card with an empty shared secret.
+    ///
+    /// For V1 cards, use [`Self::init`] or [`Self::init_with_secret`] instead.
+    pub fn init_v2(
+        &mut self,
+        pin: &str,
+        puk: &str,
+    ) -> Result<ApduResponse, Error> {
+        self.init_v2_with_options(pin, None, puk, 0, 0)
+    }
+
+    /// Initializes the card without a pairing password (V2 only), with
+    /// optional alt PIN and retry counts.
+    ///
+    /// Secure Channel V2 does not use a shared secret for pairing, so this
+    /// convenience method initializes the card with an empty shared secret.
+    ///
+    /// For V1 cards, use [`Self::init_with_options`] or [`Self::init_with_secret`] instead.
+    pub fn init_v2_with_options(
+        &mut self,
+        pin: &str,
+        alt_pin: Option<&str>,
+        puk: &str,
+        pin_retries: u8,
+        puk_retries: u8,
+    ) -> Result<ApduResponse, Error> {
+        self.init_with_secret(pin, alt_pin, puk, &[], pin_retries, puk_retries)
+    }
+
     /// Sends the FACTORY RESET command.
     ///
     /// This is sent as a raw (unencrypted) command.

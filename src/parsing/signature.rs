@@ -254,7 +254,7 @@ mod tests {
         let pk_bytes = affine.to_sec1_point(false).to_bytes().to_vec();
 
         // Sign the hash
-        let (sig, recovery_id) = signing_key.sign_prehash_recoverable(&hash);
+        let (sig, recovery_id) = signing_key.sign_prehash_recoverable(&hash).unwrap();
         let sig_bytes = sig.to_bytes();
         let r: Vec<u8> = sig_bytes[..32].to_vec();
         let s: Vec<u8> = sig_bytes[32..].to_vec();
@@ -288,7 +288,7 @@ mod tests {
         // Generate a key pair and sign
         let mut rng = getrandom_04::SysRng;
         let signing_key = SigningKey::try_generate_from_rng(&mut rng).unwrap();
-        let (sig, recovery_id) = signing_key.sign_prehash_recoverable(&hash);
+        let (sig, recovery_id) = signing_key.sign_prehash_recoverable(&hash).unwrap();
         let sig_bytes = sig.to_bytes();
 
         // Build raw signature TLV: tag 0x80, length 65, r || s || rec_id
@@ -322,7 +322,7 @@ mod tests {
         let public_key = PublicKey::from(pk);
         let affine: AffinePoint = public_key.into();
         let pk_bytes = affine.to_sec1_point(false).to_bytes().to_vec();
-        let (sig, _recovery_id) = signing_key.sign_prehash_recoverable(&hash);
+        let (sig, _recovery_id) = signing_key.sign_prehash_recoverable(&hash).unwrap();
         let sig_bytes = sig.to_bytes();
         let r_bytes: [u8; 32] = sig_bytes[..32].try_into().unwrap();
         let s_bytes: [u8; 32] = sig_bytes[32..].try_into().unwrap();
@@ -383,7 +383,7 @@ mod tests {
         let public_key = PublicKey::from(pk);
         let affine: AffinePoint = public_key.into();
         let pk_bytes = affine.to_sec1_point(false).to_bytes().to_vec();
-        let (sig, _recovery_id) = signing_key.sign_prehash_recoverable(&hash);
+        let (sig, _recovery_id) = signing_key.sign_prehash_recoverable(&hash).unwrap();
         let sig_bytes = sig.to_bytes();
         let r_bytes: [u8; 32] = sig_bytes[..32].try_into().unwrap();
         let s_bytes: [u8; 32] = sig_bytes[32..].try_into().unwrap();

@@ -444,9 +444,10 @@ impl SecureChannelV2 {
         hasher.update(&card_uncompressed);
         let transcript_hash = hasher.finalize();
 
-        // Parse the signature
+        // Parse the signature and normalize S to low-S form.
         let sig = Signature::from_der(signature_bytes)
-            .map_err(|_| Error::Crypto("Failed to parse card signature DER".to_string()))?;
+            .map_err(|_| Error::Crypto("Failed to parse card signature DER".to_string()))?
+            .normalize_s();
 
         // Verify using the card's identity public key
         let verifying_key = parse_verifying_key(card_ident_pub)?;
