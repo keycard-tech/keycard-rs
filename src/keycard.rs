@@ -603,6 +603,39 @@ impl KeycardCommandSet {
         self.send_protected(ins::EXPORT_LEE, source, 0, path)
     }
 
+    /// Exports a BIP85 derived key at the given derivation path.
+    ///
+    /// # Arguments
+    /// * `keypath` — BIP85 path string (e.g. `"m/83696968'/0'/0'"`).
+    /// * `length` — The desired output length in bytes (passed as P1).
+    ///
+    /// The returned data is the raw BIP85 output from the card with no
+    /// additional parsing.
+    pub fn export_bip85(
+        &mut self,
+        keypath: &str,
+        length: u8,
+    ) -> Result<ApduResponse, Error> {
+        let path = KeyPath::from_str(keypath)?;
+        self.export_bip85_raw(path.data(), length)
+    }
+
+    /// Exports a BIP85 derived key using raw path data.
+    ///
+    /// # Arguments
+    /// * `path` — Raw BIP32 path bytes.
+    /// * `length` — The desired output length in bytes (passed as P1).
+    ///
+    /// The returned data is the raw BIP85 output from the card with no
+    /// additional parsing.
+    pub fn export_bip85_raw(
+        &mut self,
+        path: &[u8],
+        length: u8,
+    ) -> Result<ApduResponse, Error> {
+        self.send_protected(ins::EXPORT_BIP85, length, 0, path)
+    }
+
     // -----------------------------------------------------------------------
     // APDU commands — Data storage
     // -----------------------------------------------------------------------

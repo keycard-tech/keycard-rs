@@ -69,6 +69,8 @@ pub mod ins {
     pub const EXPORT_KEY: u8 = 0xC2;
     /// Export LEE key
     pub const EXPORT_LEE: u8 = 0xC3;
+    /// Export BIP85 derived key
+    pub const EXPORT_BIP85: u8 = 0xC4;
     /// Get data
     pub const GET_DATA: u8 = 0xCA;
     /// Store data
