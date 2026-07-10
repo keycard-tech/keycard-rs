@@ -285,8 +285,8 @@ pub const PAIRING_PASSWORD_SALT: &[u8] = b"Keycard Pairing Password Salt";
 /// BIP39 mnemonic seed derivation prefix
 pub const MNEMONIC_SEED_PREFIX: &str = "mnemonic";
 
-/// Default PBKDF2 iterations for pairing password
-pub const DEFAULT_PAIRING_PBKDF2_ITERATIONS: u32 = 50_000;
+/// PBKDF2 iterations for pairing password
+pub const PAIRING_PBKDF2_ITERATIONS: u32 = 50_000;
 
 /// BIP39 PBKDF2 iterations for mnemonic seed derivation
 pub const MNEMONIC_PBKDF2_ITERATIONS: u32 = 2048;

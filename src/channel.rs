@@ -1,5 +1,4 @@
 use crate::apdu::{ApduCommand, ApduResponse};
-use crate::constants::DEFAULT_PAIRING_PBKDF2_ITERATIONS;
 use crate::error::Error;
 
 /// Trait for APDU transport channels.
@@ -18,12 +17,4 @@ pub trait CardChannel {
 
     /// Returns `true` if the channel has an active connection.
     fn is_connected(&self) -> bool;
-
-    /// Returns the PBKDF2 iteration count for deriving the pairing secret.
-    ///
-    /// Default is 50,000. May be overridden by implementations
-    /// for resource-constrained devices.
-    fn pairing_password_pbkdf2_iterations(&self) -> u32 {
-        DEFAULT_PAIRING_PBKDF2_ITERATIONS
-    }
 }

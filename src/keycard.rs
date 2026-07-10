@@ -206,12 +206,11 @@ impl KeycardCommandSet {
 
     /// Converts a pairing password to a binary pairing secret via PBKDF2-HMAC-SHA256.
     pub fn pairing_password_to_secret(&self, pairing_password: &str) -> Vec<u8> {
-        let iterations = self.channel.pairing_password_pbkdf2_iterations();
         let mut output = vec![0u8; 32];
         pbkdf2_hmac::<Sha256>(
             pairing_password.as_bytes(),
             constants::PAIRING_PASSWORD_SALT,
-            iterations,
+            constants::PAIRING_PBKDF2_ITERATIONS,
             &mut output,
         );
         output
@@ -867,9 +866,6 @@ mod tests {
         }
         fn is_connected(&self) -> bool {
             false
-        }
-        fn pairing_password_pbkdf2_iterations(&self) -> u32 {
-            50_000
         }
     }
 
