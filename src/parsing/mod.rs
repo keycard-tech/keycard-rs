@@ -16,4 +16,4 @@ pub use certificate::Certificate;
 pub use ethereum::to_ethereum_address;
 pub use key_path::KeyPath;
 pub use mnemonic::Mnemonic;
-pub use signature::RecoverableSignature;
+pub use signature::{RecoverableSignature, SchnorrSignature};
