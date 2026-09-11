@@ -213,6 +213,132 @@ pub fn to_uint(signed_int: &[u8]) -> Vec<u8> {
     }
 }
 
+/// BIP340 Schnorr signature (64 bytes: r || s).
+///
+/// Parsed from the card's response when using `sign_p2::BIP340_SCHNORR`.
+/// The card returns the signature in TLV format with tag `TLV_SCHNORR_SIGNATURE` (0x88).
+#[derive(Debug, Clone)]
+pub struct SchnorrSignature {
+    /// The public key returned by the card (internal, untweaked key).
+    /// Can be x-only (32 bytes), compressed (33 bytes), or uncompressed (65 bytes).
+    public_key: Vec<u8>,
+    /// R component (32 bytes).
+    r: Vec<u8>,
+    /// S component (32 bytes).
+    s: Vec<u8>,
+}
+
+impl SchnorrSignature {
+    /// Parses a Schnorr signature from the card's response.
+    ///
+    /// The card response contains TLV data with:
+    /// - `TLV_PUB_KEY` (0x80): the internal (untweaked) public key
+    /// - `TLV_SCHNORR_SIGNATURE` (0x88): the 64-byte signature (r || s)
+    ///
+    /// These may be wrapped in a `TLV_SIGNATURE_TEMPLATE` (0xA0) constructed TLV.
+    ///
+    /// # Arguments
+    /// * `tlv_data` - The TLV-encoded signature response from the card
+    pub fn from_card_response(tlv_data: &[u8]) -> Result<Self, Error> {
+        use crate::tlv::{BerTlvReader, TLV_PUB_KEY, TLV_SCHNORR_SIGNATURE, TLV_SIGNATURE_TEMPLATE};
+
+        let mut reader = BerTlvReader::new(tlv_data);
+
+        // Card may wrap the response in a constructed TLV (0xA0)
+        if reader.next_tag_is(TLV_SIGNATURE_TEMPLATE) {
+            reader
+                .enter_constructed(TLV_SIGNATURE_TEMPLATE)
+                .map_err(|e| {
+                    Error::Tlv(format!("Failed to enter signature template: {}", e))
+                })?;
+        }
+
+        // Read public key
+        let public_key = if reader.next_tag_is(TLV_PUB_KEY) {
+            reader.read_primitive(TLV_PUB_KEY).map_err(|e| {
+                Error::Tlv(format!("Failed to read public key from Schnorr signature: {}", e))
+            })?
+        } else {
+            return Err(Error::Tlv(
+                "Schnorr signature response missing public key (tag 0x80)".to_string(),
+            ));
+        };
+
+        // Read Schnorr signature
+        let sig_bytes = if reader.next_tag_is(TLV_SCHNORR_SIGNATURE) {
+            reader.read_primitive(TLV_SCHNORR_SIGNATURE).map_err(|e| {
+                Error::Tlv(format!("Failed to read Schnorr signature: {}", e))
+            })?
+        } else {
+            return Err(Error::Tlv(
+                "Schnorr signature response missing signature (tag 0x88)".to_string(),
+            ));
+        };
+
+        if sig_bytes.len() != 64 {
+            return Err(Error::Tlv(format!(
+                "Schnorr signature must be 64 bytes, got {}",
+                sig_bytes.len()
+            )));
+        }
+
+        let r = sig_bytes[0..32].to_vec();
+        let s = sig_bytes[32..64].to_vec();
+
+        Ok(Self {
+            public_key,
+            r,
+            s,
+        })
+    }
+
+    /// Direct construction from components.
+    pub fn from_components(public_key: Vec<u8>, r: Vec<u8>, s: Vec<u8>) -> Self {
+        Self { public_key, r, s }
+    }
+
+    /// Returns the public key returned by the card.
+    pub fn public_key(&self) -> &[u8] {
+        &self.public_key
+    }
+
+    /// Returns the x-only public key (32 bytes).
+    ///
+    /// If the card returned a compressed (33 bytes) or uncompressed (65 bytes)
+    /// key, this extracts the x-coordinate (bytes 1..33).
+    pub fn x_only_pubkey(&self) -> [u8; 32] {
+        match self.public_key.len() {
+            32 => self.public_key.clone().try_into().unwrap(),
+            33 | 65 => {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&self.public_key[1..33]);
+                out
+            }
+            _ => panic!(
+                "unexpected public key length: {}",
+                self.public_key.len()
+            ),
+        }
+    }
+
+    /// Returns the R component (32 bytes).
+    pub fn r(&self) -> &[u8] {
+        &self.r
+    }
+
+    /// Returns the S component (32 bytes).
+    pub fn s(&self) -> &[u8] {
+        &self.s
+    }
+
+    /// Returns the full 64-byte signature (r || s).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = self.r.clone();
+        out.extend_from_slice(&self.s);
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,5 +545,130 @@ mod tests {
         assert_eq!(sig_parsed.r().len(), 32);
         assert_eq!(sig_parsed.s().len(), 32);
         assert!(sig_parsed.rec_id() >= 0 && sig_parsed.rec_id() <= 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // SchnorrSignature tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_schnorr_signature_from_card_response() {
+        // Build a mock card response matching real card output:
+        // TLV_SIGNATURE_TEMPLATE (0xA0) wrapping TLV_PUB_KEY + TLV_SCHNORR_SIGNATURE
+        let pub_key = vec![0x02u8; 33]; // compressed pubkey
+        let r = [0xAAu8; 32];
+        let s = [0xBBu8; 32];
+        let mut sig_bytes = r.to_vec();
+        sig_bytes.extend_from_slice(&s);
+
+        let mut writer = BerTlvWriter::new();
+        writer.write_constructed(crate::tlv::TLV_SIGNATURE_TEMPLATE, |w| {
+            w.write_primitive(TLV_PUB_KEY, &pub_key);
+            w.write_primitive(crate::tlv::TLV_SCHNORR_SIGNATURE, &sig_bytes);
+        });
+        let tlv_data = writer.to_vec();
+
+        let sig = SchnorrSignature::from_card_response(&tlv_data).unwrap();
+        assert_eq!(sig.public_key(), &pub_key);
+        assert_eq!(sig.r(), &r[..]);
+        assert_eq!(sig.s(), &s[..]);
+        assert_eq!(sig.to_bytes().len(), 64);
+    }
+
+    #[test]
+    fn test_schnorr_signature_from_card_response_flat() {
+        // Flat TLV without wrapper (backward compat)
+        let pub_key = vec![0x02u8; 33];
+        let r = [0xAAu8; 32];
+        let s = [0xBBu8; 32];
+        let mut sig_bytes = r.to_vec();
+        sig_bytes.extend_from_slice(&s);
+
+        let mut writer = BerTlvWriter::new();
+        writer.write_primitive(TLV_PUB_KEY, &pub_key);
+        writer.write_primitive(crate::tlv::TLV_SCHNORR_SIGNATURE, &sig_bytes);
+        let tlv_data = writer.to_vec();
+
+        let sig = SchnorrSignature::from_card_response(&tlv_data).unwrap();
+        assert_eq!(sig.public_key(), &pub_key);
+        assert_eq!(sig.r(), &r[..]);
+        assert_eq!(sig.s(), &s[..]);
+    }
+
+    #[test]
+    fn test_schnorr_signature_x_only_pubkey_compressed() {
+        // Compressed pubkey: 0x02 || x (33 bytes)
+        let mut pub_key = vec![0x02u8];
+        pub_key.extend_from_slice(&[0x11u8; 32]);
+        let r = [0xAAu8; 32];
+        let s = [0xBBu8; 32];
+
+        let sig = SchnorrSignature::from_components(pub_key, r.to_vec(), s.to_vec());
+        let x_only = sig.x_only_pubkey();
+        assert_eq!(x_only.len(), 32);
+        assert_eq!(x_only, [0x11u8; 32]);
+    }
+
+    #[test]
+    fn test_schnorr_signature_x_only_pubkey_uncompressed() {
+        // Uncompressed pubkey: 0x04 || x || y (65 bytes)
+        let mut pub_key = vec![0x04u8];
+        pub_key.extend_from_slice(&[0x22u8; 32]); // x
+        pub_key.extend_from_slice(&[0x33u8; 32]); // y
+        let r = [0xAAu8; 32];
+        let s = [0xBBu8; 32];
+
+        let sig = SchnorrSignature::from_components(pub_key, r.to_vec(), s.to_vec());
+        let x_only = sig.x_only_pubkey();
+        assert_eq!(x_only.len(), 32);
+        assert_eq!(x_only, [0x22u8; 32]);
+    }
+
+    #[test]
+    fn test_schnorr_signature_x_only_pubkey_raw() {
+        // Already x-only (32 bytes)
+        let pub_key = vec![0x44u8; 32];
+        let r = [0xAAu8; 32];
+        let s = [0xBBu8; 32];
+
+        let sig = SchnorrSignature::from_components(pub_key.clone(), r.to_vec(), s.to_vec());
+        let x_only = sig.x_only_pubkey();
+        assert_eq!(x_only.as_slice(), &pub_key[..]);
+    }
+
+    #[test]
+    fn test_schnorr_signature_missing_pubkey() {
+        let sig_bytes = [0xAAu8; 64];
+        let mut writer = BerTlvWriter::new();
+        writer.write_primitive(crate::tlv::TLV_SCHNORR_SIGNATURE, &sig_bytes);
+        let tlv_data = writer.to_vec();
+
+        let result = SchnorrSignature::from_card_response(&tlv_data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_schnorr_signature_missing_signature() {
+        let pub_key = vec![0x02u8; 33];
+        let mut writer = BerTlvWriter::new();
+        writer.write_primitive(TLV_PUB_KEY, &pub_key);
+        let tlv_data = writer.to_vec();
+
+        let result = SchnorrSignature::from_card_response(&tlv_data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_schnorr_signature_wrong_sig_length() {
+        let pub_key = vec![0x02u8; 33];
+        let sig_bytes = [0xAAu8; 32]; // Too short
+
+        let mut writer = BerTlvWriter::new();
+        writer.write_primitive(TLV_PUB_KEY, &pub_key);
+        writer.write_primitive(crate::tlv::TLV_SCHNORR_SIGNATURE, &sig_bytes);
+        let tlv_data = writer.to_vec();
+
+        let result = SchnorrSignature::from_card_response(&tlv_data);
+        assert!(result.is_err());
     }
 }

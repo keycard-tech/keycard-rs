@@ -20,6 +20,8 @@ pub const TLV_APPLICATION_STATUS_TEMPLATE: u8 = 0xA3;
 pub const TLV_APPLICATION_INFO_TEMPLATE: u8 = 0xA4;
 /// Public key
 pub const TLV_PUB_KEY: u8 = 0x80;
+/// Schnorr signature (64 bytes: r || s)
+pub const TLV_SCHNORR_SIGNATURE: u8 = 0x88;
 /// Private key
 pub const TLV_PRIV_KEY: u8 = 0x81;
 /// Chain code

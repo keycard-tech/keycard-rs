@@ -443,10 +443,14 @@ impl KeycardCommandSet {
 
     /// Signs a hash with a derived key path and explicit algorithm.
     ///
+    /// When using `sign_p2::BIP340_SCHNORR`, `hash` can be:
+    /// - 32 bytes: the message hash (no tweak, 32 zero bytes are appended)
+    /// - 64 bytes: `hash || tweak` for BIP341-style tweaked signatures
+    ///
     /// # Arguments
-    /// * `hash` — The 32-byte hash to sign.
+    /// * `hash` — The 32-byte hash (or 64 bytes hash+tweak for Schnorr).
     /// * `path` — BIP32 path string.
-    /// * `algo` — Signing algorithm (`sign_p2::ECDSA`, `EDDSA_ED25519`, etc.).
+    /// * `algo` — Signing algorithm (`sign_p2::ECDSA`, `EDDSA_ED25519`, `BIP340_SCHNORR`, etc.).
     /// * `make_current` — Whether to make the derived key the current key.
     pub fn sign_with_path_and_algo(
         &mut self,
@@ -455,16 +459,77 @@ impl KeycardCommandSet {
         algo: u8,
         make_current: bool,
     ) -> Result<ApduResponse, Error> {
+        // For Schnorr, handle tweak padding
+        let data = if algo == constants::sign_p2::BIP340_SCHNORR {
+            match hash.len() {
+                32 => {
+                    // No tweak: append 32 zero bytes
+                    let mut extended = hash.to_vec();
+                    extended.extend_from_slice(&[0u8; 32]);
+                    extended
+                }
+                64 => hash.to_vec(),
+                other => {
+                    return Err(Error::InvalidArgument(format!(
+                        "data length must be 32 or 64 when using Schnorr, got {}",
+                        other
+                    )));
+                }
+            }
+        } else {
+            if hash.len() != 32 {
+                return Err(Error::InvalidArgument(format!(
+                    "data length must be 32, got {}",
+                    hash.len()
+                )));
+            }
+            hash.to_vec()
+        };
+
         let key_path = KeyPath::from_str(path)?;
-        let mut data = hash.to_vec();
-        data.extend_from_slice(key_path.data());
+        let mut cmd_data = data;
+        cmd_data.extend_from_slice(key_path.data());
         let p1 = key_path.source()
             | if make_current {
                 sign_p1::DERIVE_AND_MAKE_CURRENT
             } else {
                 sign_p1::DERIVE
             };
-        self.sign_raw(&data, p1, algo)
+        self.sign_raw(&cmd_data, p1, algo)
+    }
+
+    /// Signs a message using BIP341 Schnorr with an explicit tweak.
+    ///
+    /// This is used for Taproot (BIP341) signatures where the key is
+    /// "tweaked": P' = P + t*G. The card applies the tweak internally
+    /// and returns the internal (untweaked) public key.
+    ///
+    /// # Arguments
+    /// * `hash` — The 32-byte message hash to sign.
+    /// * `tweak` — The 32-byte tweak value.
+    /// * `path` — BIP32 path string.
+    pub fn sign_bip341_schnorr(
+        &mut self,
+        hash: &[u8],
+        tweak: &[u8],
+        path: &str,
+    ) -> Result<ApduResponse, Error> {
+        if hash.len() != 32 {
+            return Err(Error::InvalidArgument(format!(
+                "hash length must be 32, got {}",
+                hash.len()
+            )));
+        }
+        if tweak.len() != 32 {
+            return Err(Error::InvalidArgument(format!(
+                "tweak length must be 32, got {}",
+                tweak.len()
+            )));
+        }
+
+        let mut data = hash.to_vec();
+        data.extend_from_slice(tweak);
+        self.sign_with_path_and_algo(&data, path, constants::sign_p2::BIP340_SCHNORR, false)
     }
 
     /// Signs a hash using the pinless path.
