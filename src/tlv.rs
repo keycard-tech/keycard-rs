@@ -26,6 +26,14 @@ pub const TLV_SCHNORR_SIGNATURE: u8 = 0x88;
 pub const TLV_PRIV_KEY: u8 = 0x81;
 /// Chain code
 pub const TLV_CHAIN_CODE: u8 = 0x82;
+/// LEE nullifier secret key (NSK)
+pub const TLV_LEE_NSK: u8 = 0x83;
+/// LEE authorization secret key (ASK)
+pub const TLV_LEE_ASK: u8 = 0x84;
+/// LEE viewing seed (diversifier, VSK_D)
+pub const TLV_LEE_VSK_D: u8 = 0x85;
+/// LEE viewing seed (nullifier, VSK_Z)
+pub const TLV_LEE_VSK_Z: u8 = 0x86;
 /// Certificate
 pub const TLV_CERT: u8 = 0x8A;
 /// Capabilities

@@ -26,7 +26,7 @@ use crate::constants::{
     store_data_p1,
 };
 use crate::error::Error;
-use crate::parsing::{ApplicationInfo, Bip32KeyPair, KeyPath};
+use crate::parsing::{ApplicationInfo, Bip32KeyPair, KeyPath, LeeKey};
 use crate::secure_channel::{
     SecureChannel, SecureChannelV1, SecureChannelV2, SecureChannelVersion, Pairing,
 };
@@ -653,12 +653,33 @@ impl KeycardCommandSet {
     }
 
     /// Exports an LEE key at the given BIP32 path.
+    ///
+    /// The returned data is a constructed `TLV_KEY_TEMPLATE` containing the
+    /// LEE-Keys v1 secrets as 32-byte primitives: ASK (0x84), NSK (0x83),
+    /// VSK_D (0x85) and VSK_Z (0x86). Use [`Self::export_lee_key_parsed`] to
+    /// get these parsed into a [`LeeKey`], or [`LeeKey::from_tlv`] on the raw
+    /// response data.
     pub fn export_lee_key(&mut self, keypath: &str) -> Result<ApduResponse, Error> {
         let path = KeyPath::from_str(keypath)?;
         self.export_lee_key_raw(path.data(), path.source())
     }
 
+    /// Exports an LEE key at the given BIP32 path and parses the response.
+    ///
+    /// See [`Self::export_lee_key`] for the response layout.
+    pub fn export_lee_key_parsed(&mut self, keypath: &str) -> Result<LeeKey, Error> {
+        let resp = self.export_lee_key(keypath)?;
+        if resp.sw() != ApduResponse::SW_OK {
+            return Err(resp.check_ok().unwrap_err());
+        }
+        LeeKey::from_tlv(resp.data())
+    }
+
     /// Exports an LEE key with raw path data.
+    ///
+    /// # Arguments
+    /// * `path` — Raw BIP32 path bytes.
+    /// * `source` — The path source (use `derive_p1::SOURCE_MASTER`).
     pub fn export_lee_key_raw(
         &mut self,
         path: &[u8],

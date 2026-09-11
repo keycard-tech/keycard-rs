@@ -6,6 +6,7 @@ pub mod bip32;
 pub mod certificate;
 pub mod ethereum;
 pub mod key_path;
+pub mod lee;
 pub mod mnemonic;
 pub mod signature;
 
@@ -15,5 +16,6 @@ pub use bip32::Bip32KeyPair;
 pub use certificate::Certificate;
 pub use ethereum::to_ethereum_address;
 pub use key_path::KeyPath;
+pub use lee::LeeKey;
 pub use mnemonic::Mnemonic;
 pub use signature::{RecoverableSignature, SchnorrSignature};

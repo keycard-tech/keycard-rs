@@ -491,3 +491,118 @@ fn ecdh_flow() {
         keycard.auto_unpair().expect("unpairing failed");
     }
 }
+
+/// Integration test for the LEE (Lightweight Encryption Engine) key export.
+///
+/// Connect → select → pair (V1 only) → open secure channel → verify PIN →
+/// load a known LEE seed → export the public key and the LEE keys at the
+/// `m/43'/60'` path, validating against the applet's LEE-Keys v1 test vector.
+///
+/// **NOTE**: This loads a specific LEE seed onto the card, replacing any
+/// existing master key. Only run on a test card.
+#[test]
+#[ignore]
+fn lee_flow() {
+    use keycard_rs::parsing::LeeKey;
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    // LEE-Keys v1 test vector from the applet's LEE Keys test.
+    const LEE_MNEMONIC: &str =
+        "fan empower output between game genius forest bulk party small arm shuffle";
+    let expected_public = hex(
+        "0423134cb96d1f5ec2ec023c6462317eee077f54730b14911b2eca0f0474b42688339128c030ad646c818bb2779d2901f758a527be9b849760f8191c72cdcecf9d",
+    );
+    let expected_ask = hex("7b9530590b74199ec623fd74bedc5b981c8eb36205f9981980f80c7cefc99d7d");
+    let expected_nsk = hex("ef2b7994d905e72109f60de69ee212f82ed3b99d261916671337a8b744f7a515");
+    let expected_vsk_d = hex("9bbdfc6def553c24cd50755f8c45e120a2210e66f8a3d2d2487d591158fe7439");
+    let expected_vsk_z = hex("bfabaa3ab7f9537b11035f6f1d31a3e9d2e85249f7e42e3053386c0b14b1384e");
+
+    let path = "m/43'/60'";
+
+    // 1. Connect and select
+    let channel = PcscChannel::connect().expect("failed to connect to card via PC/SC");
+    let channel = LoggingChannel::new(channel);
+    let mut keycard = KeycardCommandSet::new_with_ca(channel, TEST_CA_PUBLIC_KEY);
+    let resp = keycard.select().expect("SELECT failed");
+    assert!(resp.is_ok(), "SELECT failed: {:02X} {:02X}", resp.sw1(), resp.sw2());
+
+    let info = keycard.app_info().expect("app_info should be set");
+    let has_secure_channel = info.has_secure_channel();
+
+    // 2. Pair with default password (V1 only)
+    if has_secure_channel && keycard.secure_channel_version() == Some(SecureChannelVersion::V1) {
+        keycard
+            .auto_pair("KeycardDefaultPairing")
+            .expect("pairing failed");
+    }
+
+    // 3. Open secure channel
+    if has_secure_channel {
+        keycard
+            .auto_open_secure_channel()
+            .expect("failed to open secure channel");
+    }
+
+    // 4. Verify PIN
+    let pin_resp = keycard.verify_pin("000000").expect("verify_pin failed");
+    assert!(
+        pin_resp.is_ok(),
+        "PIN verification failed: {:02X} {:02X}",
+        pin_resp.sw1(),
+        pin_resp.sw2()
+    );
+
+    // 5. Load the known LEE seed (replaces the current master key)
+    let seed = Mnemonic::binary_seed_from_phrase(LEE_MNEMONIC, "");
+    let load_resp = keycard.load_lee_key(&seed).expect("load_lee_key failed");
+    assert!(
+        load_resp.is_ok(),
+        "load_lee_key failed: {:02X} {:02X}",
+        load_resp.sw1(),
+        load_resp.sw2()
+    );
+
+    // 6. Export the public key at m/43'/60'
+    let export_resp = keycard
+        .export_key(path, false, true)
+        .expect("export_key failed");
+    assert!(
+        export_resp.is_ok(),
+        "export_key failed: {:02X} {:02X}",
+        export_resp.sw1(),
+        export_resp.sw2()
+    );
+    let pub_key = Bip32KeyPair::from_tlv(export_resp.data())
+        .expect("failed to parse exported key")
+        .public_key()
+        .to_vec();
+    assert_eq!(pub_key, expected_public, "LEE public key mismatch");
+
+    // 7. Export the LEE keys at m/43'/60' and validate the parsed components
+    let lee_resp = keycard
+        .export_lee_key(path)
+        .expect("export_lee_key failed");
+    assert!(
+        lee_resp.is_ok(),
+        "export_lee_key failed: {:02X} {:02X}",
+        lee_resp.sw1(),
+        lee_resp.sw2()
+    );
+
+    let lee = LeeKey::from_tlv(lee_resp.data()).expect("failed to parse LEE key");
+    assert_eq!(lee.ask(), expected_ask.as_slice(), "ASK mismatch");
+    assert_eq!(lee.nsk(), expected_nsk.as_slice(), "NSK mismatch");
+    assert_eq!(lee.vsk_d(), expected_vsk_d.as_slice(), "VSK_D mismatch");
+    assert_eq!(lee.vsk_z(), expected_vsk_z.as_slice(), "VSK_Z mismatch");
+
+    // 8. Unpair (V1 only)
+    if has_secure_channel && keycard.secure_channel_version() == Some(SecureChannelVersion::V1) {
+        keycard.auto_unpair().expect("unpairing failed");
+    }
+}
