@@ -362,3 +362,132 @@ fn factory_reset_and_init() {
         eprintln!("secure channel verification passed");
     }
 }
+
+/// Integration test for the ECDH command (NIP-44 / EIP-1581 paths only).
+///
+/// Connect → select → pair (V1 only) → open secure channel → verify PIN →
+/// load test master key (if none present) → run an ECDH key agreement on the
+/// NIP-44 path and verify the card's result host-side.
+///
+/// Requires the `KEYCARD_TEST_PIN` environment variable set to this card's
+/// actual PIN.
+#[test]
+#[ignore]
+fn ecdh_flow() {
+    use k256::elliptic_curve::Generate;
+    use k256::elliptic_curve::point::AffineCoordinates;
+    use k256::elliptic_curve::sec1::ToSec1Point;
+    use k256::{ProjectivePoint, PublicKey, SecretKey};
+    use getrandom_04::SysRng;
+
+    let pin = std::env::var("KEYCARD_TEST_PIN")
+        .expect("set KEYCARD_TEST_PIN to this card's actual PIN before running ecdh_flow");
+
+    // 1. Connect and select
+    let channel = PcscChannel::connect().expect("failed to connect to card via PC/SC");
+    let channel = LoggingChannel::new(channel);
+    let mut keycard = KeycardCommandSet::new_with_ca(channel, TEST_CA_PUBLIC_KEY);
+    let resp = keycard.select().expect("SELECT failed");
+    assert!(resp.is_ok(), "SELECT failed: {:02X} {:02X}", resp.sw1(), resp.sw2());
+
+    let info = keycard.app_info().expect("app_info should be set");
+    let has_secure_channel = info.has_secure_channel();
+    let has_master_key = info.has_master_key();
+
+    // 2. Pair with default password (V1 only)
+    if has_secure_channel && keycard.secure_channel_version() == Some(SecureChannelVersion::V1) {
+        keycard
+            .auto_pair("KeycardDefaultPairing")
+            .expect("pairing failed");
+    }
+
+    // 3. Open secure channel
+    if has_secure_channel {
+        keycard
+            .auto_open_secure_channel()
+            .expect("failed to open secure channel");
+    }
+
+    // 4. Verify PIN
+    let pin_resp = keycard.verify_pin(&pin).expect("verify_pin failed");
+    assert!(
+        pin_resp.is_ok(),
+        "PIN verification failed: {:02X} {:02X}",
+        pin_resp.sw1(),
+        pin_resp.sw2()
+    );
+
+    // 5. Load a test master key if none is present
+    if !has_master_key {
+        const TEST_MNEMONIC: &str =
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let seed = Mnemonic::binary_seed_from_phrase(TEST_MNEMONIC, "");
+        let load_resp = keycard.load_key(&seed).expect("load_key failed");
+        assert!(
+            load_resp.is_ok(),
+            "load_key failed: {:02X} {:02X}",
+            load_resp.sw1(),
+            load_resp.sw2()
+        );
+        eprintln!("loaded test master key from mnemonic");
+    }
+
+    // 6. NIP-44 path
+    let path = "m/44'/1237'/0'/0/0";
+
+    // 7. Export the card's public key at the NIP-44 path (public only)
+    let export_resp = keycard
+        .export_key(path, false, true)
+        .expect("export_key failed");
+    assert!(
+        export_resp.is_ok(),
+        "export failed: {:02X} {:02X}",
+        export_resp.sw1(),
+        export_resp.sw2()
+    );
+    let card_pub = Bip32KeyPair::from_tlv(export_resp.data())
+        .expect("failed to parse exported key")
+        .public_key()
+        .to_vec();
+
+    // 8. Host keypair
+    let mut rng = SysRng;
+    let peer_secret = SecretKey::try_generate_from_rng(&mut rng)
+        .expect("failed to generate peer secret");
+    let peer_pub_uncompressed = peer_secret
+        .public_key()
+        .to_sec1_point(false)
+        .as_bytes()
+        .to_vec();
+
+    // 9. Card computes A_priv x B_pub
+    let ecdh_resp = keycard
+        .ecdh(&peer_pub_uncompressed, path)
+        .expect("ecdh failed");
+    assert!(
+        ecdh_resp.is_ok(),
+        "ecdh failed: {:02X} {:02X}",
+        ecdh_resp.sw1(),
+        ecdh_resp.sw2()
+    );
+
+    // 10. Host computes B_priv x A_pub and compares the x-coordinate
+    let card_pub_point =
+        PublicKey::from_sec1_bytes(&card_pub).expect("failed to parse card public key");
+    let shared_point =
+        ProjectivePoint::from(card_pub_point.as_affine()) * *peer_secret.to_nonzero_scalar();
+    let expected: [u8; 32] = shared_point.to_affine().x().into();
+
+    assert_eq!(
+        ecdh_resp.data(),
+        &expected[..],
+        "ECDH shared secret mismatch: card {:02X?} vs host {:02X?}",
+        ecdh_resp.data(),
+        expected
+    );
+
+    // 11. Unpair (V1 only)
+    if has_secure_channel && keycard.secure_channel_version() == Some(SecureChannelVersion::V1) {
+        keycard.auto_unpair().expect("unpairing failed");
+    }
+}

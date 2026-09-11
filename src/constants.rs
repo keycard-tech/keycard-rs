@@ -71,6 +71,8 @@ pub mod ins {
     pub const EXPORT_LEE: u8 = 0xC3;
     /// Export BIP85 derived key
     pub const EXPORT_BIP85: u8 = 0xC4;
+    /// ECDH key agreement
+    pub const ECDH: u8 = 0xC5;
     /// Get data
     pub const GET_DATA: u8 = 0xCA;
     /// Store data
@@ -191,6 +193,12 @@ pub mod export_key_p2 {
     pub const EXTENDED_PUBLIC: u8 = 0x02;
 }
 
+/// ECDH P2 values
+pub mod ecdh_p2 {
+    /// Return the raw shared secret (x-coordinate of the resulting point)
+    pub const RAW_SECRET: u8 = 0x00;
+}
+
 /// PAIR P1 values
 pub mod pair_p1 {
     /// First step of pairing
@@ -277,6 +285,20 @@ pub const DEFAULT_CA_PUBLIC_KEY: [u8; 33] = [
     0x86, 0x6f, 0xf1, 0x29, 0x4d, 0x2c, 0x1e,
     0x30, 0x4e, 0x22, 0x8a, 0x86, 0xe1, 0x0c,
     0x33, 0x43, 0x50, 0x1c,
+];
+
+/// Uncompressed secp256k1 point tag (the `0x04` prefix byte).
+pub const UNCOMPRESSED_POINT_TAG: u8 = 0x04;
+
+/// Length of an uncompressed secp256k1 public key (`0x04 || X || Y`, 65 bytes).
+pub const SECP256K1_UNCOMPRESSED_PUB_KEY_SIZE: usize = 65;
+
+/// BIP32 prefix for NIP-44 paths (`m/44'/1237'`).
+pub const NIP44_PREFIX: &[u8] = &[0x80, 0x00, 0x00, 0x2C, 0x80, 0x00, 0x04, 0xD5];
+
+/// BIP32 prefix for EIP-1581 paths (`m/43'/60'/1581'`).
+pub const EIP_1581_PREFIX: &[u8] = &[
+    0x80, 0x00, 0x00, 0x2B, 0x80, 0x00, 0x00, 0x3C, 0x80, 0x00, 0x06, 0x2D,
 ];
 
 /// Pairing password salt

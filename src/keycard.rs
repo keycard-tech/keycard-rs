@@ -701,6 +701,73 @@ impl KeycardCommandSet {
     }
 
     // -----------------------------------------------------------------------
+    // APDU commands — Key agreement (ECDH)
+    // -----------------------------------------------------------------------
+
+    /// Computes an ECDH shared secret between the key derived at the given
+    /// path and a peer public key.
+    ///
+    /// The card only permits derivation under the NIP-44 (`m/44'/1237'`) and
+    /// EIP-1581 (`m/43'/60'/1581'`) prefixes at a depth of at least 5
+    /// components; any other path is refused by the card.
+    ///
+    /// The returned data is the raw x-coordinate of the resulting point
+    /// (32 bytes), **not** an encryption key. Protocols are expected to run
+    /// it through a KDF host-side (NIP-44 uses HKDF-extract with salt
+    /// `"nip44-v2"`).
+    ///
+    /// # Arguments
+    /// * `peer_public_key` — The peer's uncompressed secp256k1 public key
+    ///   (`0x04 || X || Y`, 65 bytes).
+    /// * `keypath` — BIP32 path string (e.g. `"m/44'/1237'/0'/0/0"`). Must
+    ///   be an absolute path derived from the master key.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidArgument`] if the peer public key is not a
+    /// 65-byte uncompressed point, or if the path is not absolute.
+    pub fn ecdh(&mut self, peer_public_key: &[u8], keypath: &str) -> Result<ApduResponse, Error> {
+        let path = KeyPath::from_str(keypath)?;
+        if path.source() != derive_p1::SOURCE_MASTER {
+            return Err(Error::InvalidArgument(
+                "ECDH requires an absolute path derived from the master key".to_string(),
+            ));
+        }
+        self.ecdh_raw(peer_public_key, path.data())
+    }
+
+    /// Computes an ECDH shared secret using raw path bytes.
+    ///
+    /// The peer public key must be an uncompressed secp256k1 point
+    /// (`0x04 || X || Y`, 65 bytes) and the path is appended verbatim.
+    ///
+    /// # Arguments
+    /// * `peer_public_key` — The peer's uncompressed secp256k1 public key
+    ///   (`0x04 || X || Y`, 65 bytes).
+    /// * `path` — Raw BIP32 path bytes (absolute, from master).
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidArgument`] if the peer public key is not a
+    /// 65-byte uncompressed point.
+    pub fn ecdh_raw(&mut self, peer_public_key: &[u8], path: &[u8]) -> Result<ApduResponse, Error> {
+        if peer_public_key.len() != constants::SECP256K1_UNCOMPRESSED_PUB_KEY_SIZE
+            || peer_public_key.first() != Some(&constants::UNCOMPRESSED_POINT_TAG)
+        {
+            return Err(Error::InvalidArgument(format!(
+                "peer public key must be a {} byte uncompressed point (0x04 || X || Y), got {} bytes",
+                constants::SECP256K1_UNCOMPRESSED_PUB_KEY_SIZE,
+                peer_public_key.len()
+            )));
+        }
+
+        let mut data = Vec::with_capacity(peer_public_key.len() + path.len());
+        data.extend_from_slice(peer_public_key);
+        data.extend_from_slice(path);
+
+        // P1 is always SIGN_P1_DERIVE (0x01) and P2 is always RAW_SECRET.
+        self.send_protected(ins::ECDH, sign_p1::DERIVE, constants::ecdh_p2::RAW_SECRET, &data)
+    }
+
+    // -----------------------------------------------------------------------
     // APDU commands — Data storage
     // -----------------------------------------------------------------------
 
@@ -922,6 +989,30 @@ mod tests {
     use super::*;
     use crate::channel::CardChannel;
 
+    /// Mock channel that captures APDU commands for inspection via shared state.
+    struct CapturingChannel {
+        last_cmd: std::rc::Rc<std::cell::RefCell<Option<ApduCommand>>>,
+    }
+
+    impl CapturingChannel {
+        fn new() -> (Self, std::rc::Rc<std::cell::RefCell<Option<ApduCommand>>>) {
+            let last_cmd = std::rc::Rc::new(std::cell::RefCell::new(None));
+            (Self {
+                last_cmd: last_cmd.clone(),
+            }, last_cmd)
+        }
+    }
+
+    impl CardChannel for CapturingChannel {
+        fn send(&mut self, cmd: &ApduCommand) -> Result<ApduResponse, Error> {
+            *self.last_cmd.borrow_mut() = Some(cmd.clone());
+            ApduResponse::new(&[0x90, 0x00])
+        }
+        fn is_connected(&self) -> bool {
+            false
+        }
+    }
+
     /// Mock channel for testing constructor and accessor logic.
     struct MockChannel;
 
@@ -954,5 +1045,105 @@ mod tests {
         let secret2 = kcs.pairing_password_to_secret("test");
         assert_eq!(secret1, secret2);
         assert_eq!(secret1.len(), 32);
+    }
+
+    #[test]
+    fn test_ecdh_builds_correct_apdu() {
+        let (channel, last_cmd) = CapturingChannel::new();
+        let mut kcs = KeycardCommandSet::new(channel);
+
+        // Peer public key: 0x04 || X || Y (65 bytes)
+        let mut peer_pub = vec![0x04u8];
+        peer_pub.extend_from_slice(&[0x11u8; 32]); // X
+        peer_pub.extend_from_slice(&[0x22u8; 32]); // Y
+
+        let resp = kcs.ecdh(&peer_pub, "m/44'/1237'/0'/0/0").unwrap();
+        assert!(resp.is_ok());
+
+        let cmd = last_cmd.borrow().as_ref().expect("command captured").clone();
+        assert_eq!(cmd.cla(), 0x80);
+        assert_eq!(cmd.ins(), ins::ECDH);
+        assert_eq!(cmd.p1(), sign_p1::DERIVE);
+        assert_eq!(cmd.p2(), constants::ecdh_p2::RAW_SECRET);
+
+        // Data layout: peer pub (65 bytes) || path (5 * 4 = 20 bytes)
+        let expected_path = KeyPath::from_str("m/44'/1237'/0'/0/0").unwrap();
+        assert_eq!(cmd.data().len(), 65 + expected_path.data().len());
+        assert_eq!(&cmd.data()[..65], &peer_pub[..]);
+        assert_eq!(&cmd.data()[65..], expected_path.data());
+    }
+
+    #[test]
+    fn test_ecdh_rejects_non_absolute_path() {
+        let (channel, _last_cmd) = CapturingChannel::new();
+        let mut kcs = KeycardCommandSet::new(channel);
+
+        let mut peer_pub = vec![0x04u8];
+        peer_pub.extend_from_slice(&[0x11u8; 32]);
+        peer_pub.extend_from_slice(&[0x22u8; 32]);
+
+        // A relative path (source != MASTER) must be rejected host-side.
+        let err = kcs.ecdh(&peer_pub, "./44'/1237'/0'/0/0").unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn test_ecdh_rejects_bad_peer_key() {
+        let (channel, _last_cmd) = CapturingChannel::new();
+        let mut kcs = KeycardCommandSet::new(channel);
+
+        // Wrong length
+        let err = kcs.ecdh(&[0x04u8; 10], "m/44'/1237'/0'/0/0").unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+
+        // Wrong tag
+        let mut peer_pub = vec![0x02u8];
+        peer_pub.extend_from_slice(&[0x11u8; 32]);
+        peer_pub.extend_from_slice(&[0x22u8; 32]);
+        let err = kcs.ecdh(&peer_pub, "m/44'/1237'/0'/0/0").unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn test_ecdh_raw_appends_path() {
+        let (channel, last_cmd) = CapturingChannel::new();
+        let mut kcs = KeycardCommandSet::new(channel);
+
+        let mut peer_pub = vec![0x04u8];
+        peer_pub.extend_from_slice(&[0x11u8; 32]);
+        peer_pub.extend_from_slice(&[0x22u8; 32]);
+
+        let raw_path = vec![0x80, 0x00, 0x00, 0x2C]; // 44'
+        kcs.ecdh_raw(&peer_pub, &raw_path).unwrap();
+
+        let cmd = last_cmd.borrow().as_ref().expect("command captured").clone();
+        assert_eq!(cmd.p1(), sign_p1::DERIVE);
+        assert_eq!(cmd.p2(), constants::ecdh_p2::RAW_SECRET);
+        assert_eq!(cmd.data().len(), 65 + 4);
+        assert_eq!(&cmd.data()[65..], &raw_path[..]);
+    }
+
+    #[test]
+    fn test_ecdh_path_prefixes() {
+        // NIP-44: m/44'/1237'
+        let nip44 = KeyPath::from_str("m/44'/1237'").unwrap();
+        assert_eq!(nip44.data(), constants::NIP44_PREFIX);
+
+        // EIP-1581: m/43'/60'/1581'
+        let eip1581 = KeyPath::from_str("m/43'/60'/1581'").unwrap();
+        assert_eq!(eip1581.data(), constants::EIP_1581_PREFIX);
+
+        // These are the only prefixes the card accepts for ECDH.
+        assert_eq!(constants::NIP44_PREFIX.len(), 8);
+        assert_eq!(constants::EIP_1581_PREFIX.len(), 12);
+    }
+
+    #[test]
+    fn test_ecdh_constant_values() {
+        assert_eq!(ins::ECDH, 0xC5);
+        assert_eq!(constants::ecdh_p2::RAW_SECRET, 0x00);
+        assert_eq!(constants::UNCOMPRESSED_POINT_TAG, 0x04);
+        assert_eq!(constants::SECP256K1_UNCOMPRESSED_PUB_KEY_SIZE, 65);
+        assert_eq!(sign_p1::DERIVE, 0x01);
     }
 }
